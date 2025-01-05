@@ -466,9 +466,10 @@ class SpotifyAPI:
         return await self._get_token()
 
     async def get_artists(
-            self,
-            artist_ids: List[str],
-            skip_cache: bool = False,
+        self,
+        artist_ids: List[str],
+        skip_cache: bool = False,
+        detail: bool = False
     ) -> Dict[str, Optional[Dict]]:
         await self._ensure_initialized()
         # Get unique artist IDs while preserving order
@@ -488,7 +489,7 @@ class SpotifyAPI:
 
             formatted_results = {}
             for i, artist_data in enumerate(valid_artists):
-                formatted = self._format_artist(artist_data)
+                formatted = self._format_artist(artist_data, detail)
                 if formatted:
                     artist_id = unique_ids[i]
                     formatted_results[artist_id] = formatted
@@ -515,7 +516,7 @@ class SpotifyAPI:
 
             for i, result in enumerate(fetched_artists):
                 if isinstance(result, dict):
-                    formatted = self._format_artist(result)
+                    formatted = self._format_artist(result, detail)
                     if formatted:
                         valid_artists.append(formatted)
 
@@ -602,8 +603,12 @@ class SpotifyAPI:
             self.rate_limiter.release()
 
     @staticmethod
-    def _format_artist(artist_data: Dict) -> Optional[Dict]:
+    def _format_artist(artist_data: Dict, detail: bool = False) -> Optional[Dict]:
         """Format an artist response from Spotify Partner API"""
+        # If detail is True, return the full response
+        if detail:
+            return artist_data.get('data', {}).get('artistUnion', {})
+
         # Extract artist data
         artist = artist_data.get('data', {}).get('artistUnion', {})
         if not artist:

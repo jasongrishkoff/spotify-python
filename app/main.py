@@ -164,18 +164,23 @@ async def get_playlists(
 
 class ArtistRequest(BaseModel):
     ids: List[str]
+    detail: Optional[bool] = False
 
 @app.get("/api/artist/{artist_id}")
 async def get_artist(
     artist_id: str,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    detail: bool = False  # New query parameter
 ):
-    """Get a single artist by ID"""
-    logger.info(f"Starting artist fetch for ID: {artist_id}")
+    """
+    Get a single artist by ID.
+    Optionally return detailed data when detail=true
+    """
+    logger.info(f"Starting artist fetch for ID: {artist_id} with detail={detail}")
     try:
         # First try to get the artist
         logger.info(f"Calling spotify_api.get_artists for {artist_id}")
-        results = await spotify_api.get_artists([artist_id], skip_cache=True)
+        results = await spotify_api.get_artists([artist_id], skip_cache=True, detail=detail)
         logger.info(f"Results type from get_artists: {type(results)}")
         logger.info(f"Results content: {results}")
 
@@ -221,15 +226,15 @@ async def get_artists(
     request: ArtistRequest,
     background_tasks: BackgroundTasks
 ):
-    """Get multiple artists by their IDs"""
+    """Get multiple artists by their IDs. Optionally return detailed data."""
     try:
         if not request.ids:
             raise HTTPException(status_code=400, detail="No artist IDs provided")
 
         if len(request.ids) > 100:
             raise HTTPException(status_code=400, detail="Maximum 100 artist IDs per request")
- 
-        results = await spotify_api.get_artists(request.ids)
+
+        results = await spotify_api.get_artists(request.ids, detail=request.detail)
 
         # Convert to array and filter out None values
         valid_results = [
@@ -245,7 +250,7 @@ async def get_artists(
         background_tasks.add_task(refresh_token_task)
 
         return valid_results
-        
+
     except Exception as e:
         logger.error(f"Error fetching artists: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
