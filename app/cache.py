@@ -6,23 +6,31 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 class RedisCache:
     def __init__(self, host='localhost', port=6379, db=0):
         self.redis = redis.Redis(host=host, port=port, db=db, decode_responses=True)
-        self._lock_key = "spotify_token_lock"
-        self._artist_lock_key = "spotify_artist_token_lock"
+        # Separate lock keys for different token types
+        self._lock_keys = {
+            'playlist': 'spotify_playlist_token_lock',
+            'track': 'spotify_track_token_lock',
+            'artist': 'spotify_artist_token_lock'
+        }
         
     async def get_token(self, token_type: str = 'playlist') -> Optional[Dict]:
+        """Get token data from Redis based on token type."""
         try:
-            key = 'spotify_artist_token' if token_type == 'artist' else 'spotify_token'
+            # Different keys for different token types
+            key = f'spotify_{token_type}_token'
             data = await self.redis.get(key)
             if data:
                 return json.loads(data)
         except Exception as e:
-            logger.error(f"Redis get error: {e}")
+            logger.error(f"Redis get error for {token_type} token: {e}")
         return None
         
-    async def save_token(self, token: str, proxy: Dict, token_type: str = 'playlist', artist_hash: Optional[str] = None) -> bool:
+    async def save_token(self, token: str, proxy: Dict, token_type: str = 'playlist', hash_value: Optional[str] = None) -> bool:
+        """Save token data to Redis with appropriate type and hash."""
         try:
             # Ensure created_at is included in proxy data
             proxy_data = proxy.copy()
@@ -33,20 +41,41 @@ class RedisCache:
                 'proxy': proxy_data
             }
             
-            # Add artist hash if provided
-            if artist_hash:
-                data['artist_hash'] = artist_hash
+            # Add hash if provided
+            if hash_value:
+                data['hash_value'] = hash_value
                 
-            key = 'spotify_artist_token' if token_type == 'artist' else 'spotify_token'
-            await self.redis.set(key, json.dumps(data), ex=3600)  # 1 hour expiry
+            # Different keys for different token types
+            key = f'spotify_{token_type}_token'
+            
+            # Store with 1 hour expiry
+            await self.redis.set(key, json.dumps(data), ex=3600)
             return True
         except Exception as e:
-            logger.error(f"Redis save error: {e}")
+            logger.error(f"Redis save error for {token_type} token: {e}")
+            return False
+
+    async def get_discovered_hash(self) -> Optional[str]:
+        """Get the discovered-on hash from Redis."""
+        try:
+            hash_value = await self.redis.get('spotify_discovered_hash')
+            return hash_value
+        except Exception as e:
+            logger.error(f"Redis get discovered hash error: {e}")
+            return None
+
+    async def save_discovered_hash(self, hash_value: str) -> bool:
+        """Save the discovered-on hash to Redis."""
+        try:
+            await self.redis.set('spotify_discovered_hash', hash_value, ex=3600)  # 1 hour expiry
+            return True
+        except Exception as e:
+            logger.error(f"Redis save discovered hash error: {e}")
             return False
 
     async def acquire_lock(self, token_type: str = 'playlist', timeout: int = 10) -> bool:
-        """Acquire lock for token refresh"""
-        lock_key = self._artist_lock_key if token_type == 'artist' else self._lock_key
+        """Acquire lock for specific token type refresh."""
+        lock_key = self._lock_keys.get(token_type, 'spotify_token_lock')
         return await self.redis.set(
             lock_key,
             'locked',
@@ -55,25 +84,17 @@ class RedisCache:
         ) is not None
         
     async def release_lock(self, token_type: str = 'playlist'):
-        """Release token refresh lock"""
-        lock_key = self._artist_lock_key if token_type == 'artist' else self._lock_key
+        """Release lock for specific token type."""
+        lock_key = self._lock_keys.get(token_type, 'spotify_token_lock')
         await self.redis.delete(lock_key)
 
-    async def get_discovered_hash(self) -> Optional[str]:
-        """Get the discovered-on hash from Redis"""
-        try:
-            hash_value = await self.redis.get('spotify_discovered_hash')
-            if hash_value:
-                return hash_value
-        except Exception as e:
-            logger.error(f"Redis get discovered hash error: {e}")
-        return None
-
-    async def save_discovered_hash(self, hash_value: str) -> bool:
-        """Save the discovered-on hash to Redis"""
-        try:
-            await self.redis.set('spotify_discovered_hash', hash_value, ex=3600*24)  # 24 hour expiry
-            return True
-        except Exception as e:
-            logger.error(f"Redis save discovered hash error: {e}")
-            return False
+    async def clear_token(self, token_type: str = 'playlist'):
+        """Clear a specific token type from Redis."""
+        key = f'spotify_{token_type}_token'
+        await self.redis.delete(key)
+        
+    async def clear_all_tokens(self):
+        """Clear all token types from Redis."""
+        keys = ['spotify_playlist_token', 'spotify_track_token', 'spotify_artist_token']
+        if keys:
+            await self.redis.delete(*keys)

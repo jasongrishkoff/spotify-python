@@ -155,6 +155,53 @@ class SpotifyAPI:
 
     async def _ensure_auth(self, token_type: str = 'playlist') -> bool:
         """Ensures authentication token is valid, with proper locking and caching."""
+
+        # For track tokens, use separate method
+        if token_type == 'track':
+            # Quick check if we already have a valid token
+            if self.access_token and hasattr(self, 'track_hash'):
+                logger.info("Using existing track token")
+                return True
+
+            # Try to get token from Redis first
+            if cached := await self.cache.get_token('track'):
+                logger.info("Found cached track token in Redis")
+                cached_time = cached['proxy'].get('created_at', 0)
+                current_time = int(time.time())
+
+                # Only use cached token if it's less than 8 minutes old
+                if current_time - cached_time < 480:  # 8 minutes
+                    logger.info("Using valid cached track token")
+                    self.access_token = cached['access_token']
+                    self.track_hash = cached.get('hash_value')
+                    self.proxy = ProxyConfig(**cached['proxy'])
+                    return True
+                logger.info("Cached track token expired")
+
+            # Get new track token
+            if not await self.cache.acquire_lock('track', timeout=30):
+                logger.info("Another process is refreshing track token, waiting...")
+                # Wait for up to 30 seconds for new token
+                for _ in range(30):
+                    if cached := await self.cache.get_token('track'):
+                        self.access_token = cached['access_token']
+                        self.track_hash = cached.get('hash_value')
+                        self.proxy = ProxyConfig(**cached['proxy'])
+                        return True
+                    await asyncio.sleep(1)
+                logger.error("Timeout waiting for track token refresh")
+                return False
+
+            try:
+                success = await self._get_track_token()
+                if success:
+                    logger.info("Track token refresh successful")
+                    return True
+                logger.error("Track token refresh failed")
+                return False
+            finally:
+                await self.cache.release_lock('track')
+
         # Quick check if we already have a valid token
         if self.access_token:
             logger.info("Using existing access token")
@@ -921,3 +968,332 @@ class SpotifyAPI:
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
             return None
+
+    async def _get_track_token(self) -> bool:
+        """Get a new track token using browser automation."""
+        for retry in range(self.MAX_RETRIES):
+            try:
+                logger.info(f"Starting track token generation (attempt {retry + 1})")
+
+                if not self.proxy:
+                    self.proxy = await self._get_proxy()
+                if not self.proxy:
+                    logger.error("Failed to get proxy")
+                    continue
+
+                logger.info(f"Using proxy: {self.proxy}")
+
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(
+                        proxy=self.proxy.to_playwright_config() if self.proxy else None,
+                        headless=True,
+                        args=[
+                            '--no-sandbox',
+                            '--disable-dev-shm-usage',
+                            '--disable-gpu',
+                            '--single-process',
+                        ]
+                    )
+
+                    try:
+                        context = await browser.new_context()
+                        page = await context.new_page()
+
+                        # Track the hash we find
+                        hash_value = None
+
+                        async def handle_request(route):
+                            nonlocal hash_value
+                            url = route.request.url
+                            logger.debug(f"Intercepted request: {url}")
+                            if 'getTrack&' in url:
+                                logger.info(f"Found getTrack request: {url}")
+                                try:
+                                    # Parse URL to get the query string
+                                    parsed = urllib.parse.urlparse(url)
+                                    # Get the extensions parameter
+                                    params = urllib.parse.parse_qs(parsed.query)
+                                    if 'extensions' in params:
+                                        ext_json = urllib.parse.unquote(params['extensions'][0])
+                                        data = json.loads(ext_json)
+                                        if data.get('persistedQuery', {}).get('sha256Hash'):
+                                            hash_value = data['persistedQuery']['sha256Hash']
+                                            logger.info(f"Found track hash: {hash_value}")
+                                except Exception as e:
+                                    logger.error(f"Error parsing hash from URL: {e}")
+                            await route.continue_()
+
+                        await page.route("**/*", handle_request)
+
+                        # Navigate to a track URL
+                        url = 'https://open.spotify.com/track/6K4t31amVTZDgR3sKmwUJJ'
+                        logger.info(f"Navigating to {url}")
+                        await page.goto(url, timeout=60000)
+                        await page.wait_for_load_state('networkidle')
+                        await page.wait_for_timeout(5000)
+
+                        # Get page content for debugging if needed
+                        content = await page.content()
+                        logger.debug(f"Page content: {content[:500]}...")
+
+                        # Get token from page
+                        token_info = await page.evaluate('''() => {
+                            const script = document.getElementById('session');
+                            if (!script) {
+                                console.log('No session script found');
+                                return null;
+                            }
+                            try {
+                                return JSON.parse(script.text.trim());
+                            } catch (e) {
+                                console.log('Error parsing session script:', e);
+                                return null;
+                            }
+                        }''')
+
+                        logger.info(f"Token info found: {bool(token_info)}")
+                        logger.info(f"Hash found: {bool(hash_value)}")
+
+                        if not token_info or not token_info.get('accessToken') or not hash_value:
+                            logger.error(f"Missing track token or hash. Token: {bool(token_info)}, Hash: {bool(hash_value)}")
+                            continue
+
+                        # Store track token and hash
+                        self.access_token = token_info['accessToken']
+                        self.track_hash = hash_value
+
+                        logger.info(f"Successfully got track token. Hash: {hash_value}")
+
+                        # Save to Redis
+                        await self.cache.save_token(
+                            token=token_info['accessToken'],
+                            proxy=self.proxy.__dict__,
+                            token_type='track',
+                            hash_value=hash_value
+                        )
+
+                        return True
+
+                    except Exception as e:
+                        logger.error(f"Error during page operations: {e}")
+                        import traceback
+                        logger.error(f"Full traceback: {traceback.format_exc()}")
+                        continue
+                    finally:
+                        if browser:
+                            await browser.close()
+
+            except Exception as e:
+                logger.error(f"Error in track token acquisition: {str(e)}")
+                import traceback
+                logger.error(f"Full traceback: {traceback.format_exc()}")
+                self.proxy = None
+                await asyncio.sleep(1)
+
+        logger.error("All track token refresh attempts failed")
+        return False
+
+    async def get_tracks(
+            self,
+            track_ids: List[str],
+            skip_cache: bool = False,
+            detail: bool = False
+    ) -> Dict[str, Optional[Dict]]:
+        """Get track data for multiple track IDs"""
+        await self._ensure_initialized()
+        unique_ids = list(dict.fromkeys(track_ids))
+
+        if skip_cache:
+            fetch_tasks = [
+                self._fetch_track(tid, detail)
+                for tid in unique_ids
+            ]
+            fetched_data = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
+            results = {}
+            for i, data in enumerate(fetched_data):
+                if isinstance(data, dict):
+                    formatted = self._format_track(data, detail)
+                    if formatted:
+                        results[unique_ids[i]] = formatted
+
+            return results
+
+        # Get all cached data
+        cached_data = await self.db.get_tracks(unique_ids)
+
+        # Determine which need to be fetched
+        to_fetch = [
+            tid for tid in unique_ids
+            if not cached_data.get(tid) or not isinstance(cached_data.get(tid), dict)
+        ]
+
+        # Fetch missing data
+        if to_fetch:
+            fetch_tasks = [
+                self._fetch_track(tid, detail)
+                for tid in to_fetch
+            ]
+            fetched_data = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
+            valid_data = []
+            for i, data in enumerate(fetched_data):
+                if isinstance(data, dict):
+                    formatted = self._format_track(data, detail)
+                    if formatted:
+                        formatted['id'] = to_fetch[i]  # Add ID for caching
+                        valid_data.append(formatted)
+
+            # Save to cache and update results
+            if valid_data:
+                await self.db.save_tracks(valid_data)
+                cached_data.update({d['id']: d for d in valid_data})
+
+        return {
+            tid: cached_data.get(tid)
+            for tid in unique_ids
+            if cached_data.get(tid)
+        }
+
+    async def _fetch_track(self, track_id: str, detail: bool = False) -> Optional[Dict]:
+        """Fetch track data from Spotify Partner API"""
+        try:
+            await self.rate_limiter.acquire()
+
+            logger.info(f"Fetching track {track_id} (detail={detail})")
+
+            if not await self._ensure_auth('track'):
+                logger.error("Failed to get track auth token")
+                return None
+
+            logger.info(f"Using track token: {self.access_token[:20]}...")
+            logger.info(f"Using track hash: {getattr(self, 'track_hash', 'None')}")
+
+            if not self.session:
+                self.session = aiohttp.ClientSession()
+
+            if not self.proxy:
+                logger.error("No proxy available")
+                return None
+
+            url = "https://api-partner.spotify.com/pathfinder/v1/query"
+
+            variables = {
+                'uri': f'spotify:track:{track_id}'
+            }
+
+            extensions = {
+                'persistedQuery': {
+                    'version': 1,
+                    'sha256Hash': getattr(self, 'track_hash', '7fb74da4937948e158f48105eb4c39fc89e6a8d49fbde2e859f11844354e3908')
+                }
+            }
+
+            params = {
+                'operationName': 'getTrack',
+                'variables': json.dumps(variables),
+                'extensions': json.dumps(extensions)
+            }
+
+            logger.info(f"Track request URL: {url}")
+            logger.info(f"Track request params: {params}")
+
+            async with self.session.get(
+                url,
+                params=params,
+                headers={
+                    'Authorization': f'Bearer {self.access_token}',
+                    'content-type': 'application/json',
+                    'accept': 'application/json'
+                },
+                proxy=self.proxy.url,
+                proxy_auth=self.proxy.auth,
+                timeout=10
+            ) as response:
+                logger.info(f"Track response status: {response.status}")
+
+                response_text = await response.text()
+                logger.info(f"Track response text: {response_text[:200]}...")
+
+                if response.status == 200:
+                    data = json.loads(response_text)
+
+                    if 'errors' in data:
+                        logger.error(f"GraphQL errors in track response: {data['errors']}")
+                        return None
+
+                    if data.get('data', {}).get('trackUnion') is None:
+                        logger.error(f"No track data in response: {data}")
+                        return None
+
+                    return data
+
+                elif response.status in {401, 407}:
+                    logger.error(f"Authorization error {response.status}")
+                    error_body = await response.text()
+                    logger.error(f"Auth error response body: {error_body}")
+                    self.access_token = None
+                    self.proxy = None
+                    return None
+
+                logger.warning(f"Failed to fetch track {track_id}: {response.status}")
+                error_body = await response.text()
+                logger.error(f"Error response body: {error_body}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error fetching track {track_id}: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return None
+        finally:
+            self.rate_limiter.release()
+
+    @staticmethod
+    def _format_track(track_data: Dict, detail: bool = False) -> Optional[Dict]:
+        """Format a track response from Spotify Partner API"""
+        logger.info(f"Formatting track data structure: {list(track_data.keys()) if isinstance(track_data, dict) else 'Not a dict'}")
+
+        # For detail view, return the trackUnion data directly
+        if detail:
+            return track_data.get('data', {}).get('trackUnion', {})
+
+        # Extract track data
+        track = track_data.get('data', {}).get('trackUnion', {})
+        if not track:
+            logger.error("No trackUnion in response")
+            return None
+
+        # Get artist IDs from otherArtists and firstArtist
+        artist_ids = []
+
+        # Get artists from firstArtist
+        if track.get('firstArtist', {}).get('items'):
+            for artist in track['firstArtist']['items']:
+                if artist.get('id'):
+                    artist_ids.append(artist['id'])
+                    logger.info(f"Found artist ID from firstArtist: {artist['id']}")
+
+        # Get artists from otherArtists
+        if track.get('otherArtists', {}).get('items'):
+            for artist in track['otherArtists']['items']:
+                if artist.get('id'):
+                    artist_ids.append(artist['id'])
+                    logger.info(f"Found artist ID from otherArtists: {artist['id']}")
+
+        # Basic track data
+        formatted_data = {
+            'id': track.get('id'),
+            'playcount': track.get('playcount'),
+            'artistIds': artist_ids,
+            'name': track.get('name'),
+            'duration': track.get('duration', {}).get('totalMilliseconds'),
+        }
+
+        logger.info(f"Formatted track data: {formatted_data}")
+
+        if not formatted_data.get('id'):
+            logger.error("No track ID in formatted data")
+            return None
+
+        return formatted_data

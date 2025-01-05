@@ -46,11 +46,19 @@ class AsyncDatabase:
                     data TEXT NOT NULL,
                     created_at INTEGER NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS tracks (
+                    id TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+
                 
                 CREATE INDEX IF NOT EXISTS idx_auth_created_at ON auth(created_at);
                 CREATE INDEX IF NOT EXISTS idx_playlists_created_at ON playlists(created_at);
                 CREATE INDEX IF NOT EXISTS idx_artists_created_at ON artists(created_at);
                 CREATE INDEX IF NOT EXISTS idx_discovered_created_at ON discovered_on(created_at);
+                CREATE INDEX IF NOT EXISTS idx_tracks_created_at ON tracks(created_at);
             ''')
             await db.commit()
             self._init_done = True
@@ -227,3 +235,32 @@ class AsyncDatabase:
                 logger.error(f'Error during cleanup: {e}')
                 await db.execute('ROLLBACK')
                 raise
+
+    async def get_tracks(self, track_ids: List[str]) -> Dict[str, Dict]:
+        async with self.connection() as db:
+            placeholders = ','.join('?' * len(track_ids))
+            current_time = int(time.time()) - 3600  # 1 hour cache
+
+            query = f'''
+                SELECT id, data
+                FROM tracks
+                WHERE id IN ({placeholders})
+                AND created_at > ?
+            '''
+
+            async with db.execute(query, (*track_ids, current_time)) as cursor:
+                results = await cursor.fetchall()
+                return {
+                    row['id']: json.loads(row['data'])
+                    for row in results
+                }
+
+    async def save_tracks(self, tracks: List[Dict]):
+        async with self.connection() as db:
+            current_time = int(time.time())
+            await db.executemany(
+                'INSERT OR REPLACE INTO tracks (id, data, created_at) VALUES (?, ?, ?)',
+                [(t['id'], json.dumps(t), current_time) for t in tracks]
+            )
+            await db.commit()
+

@@ -314,3 +314,96 @@ async def get_multiple_discovered_on(
         if isinstance(e, HTTPException):
             raise
         raise HTTPException(status_code=500, detail="Internal server error")
+
+class TrackRequest(BaseModel):
+    ids: List[str]
+
+@app.get("/api/track/{track_id}")
+async def get_track(
+    track_id: str,
+    background_tasks: BackgroundTasks
+):
+    """Get a single track by ID"""
+    logger.info(f"Starting track fetch for ID: {track_id}")
+    try:
+        results = await spotify_api.get_tracks([track_id], skip_cache=True)
+
+        if not results:
+            raise HTTPException(status_code=404, detail="Track not found")
+
+        track = results.get(track_id)
+        if not track:
+            raise HTTPException(status_code=404, detail="Track not found")
+
+        # Schedule token refresh for next request if needed
+        background_tasks.add_task(refresh_token_task)
+
+        return track
+
+    except Exception as e:
+        logger.error(f"Error fetching track {track_id}: {e}")
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/track-detail/{track_id}")
+async def get_track_detail(
+    track_id: str,
+    background_tasks: BackgroundTasks
+):
+    """Get detailed track information by ID"""
+    logger.info(f"Starting detailed track fetch for ID: {track_id}")
+    try:
+        results = await spotify_api.get_tracks([track_id], skip_cache=True, detail=True)
+
+        if not results:
+            raise HTTPException(status_code=404, detail="Track not found")
+
+        track = results.get(track_id)
+        if not track:
+            raise HTTPException(status_code=404, detail="Track not found")
+
+        # Schedule token refresh for next request if needed
+        background_tasks.add_task(refresh_token_task)
+
+        return track
+
+    except Exception as e:
+        logger.error(f"Error fetching track detail {track_id}: {e}")
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/tracks")
+async def get_tracks(
+    request: TrackRequest,
+    background_tasks: BackgroundTasks
+):
+    """Get multiple tracks by their IDs"""
+    try:
+        if not request.ids:
+            raise HTTPException(status_code=400, detail="No track IDs provided")
+
+        if len(request.ids) > 100:
+            raise HTTPException(status_code=400, detail="Maximum 100 track IDs per request")
+ 
+        results = await spotify_api.get_tracks(request.ids)
+
+        # Convert to array and filter out None values
+        valid_results = [
+            data
+            for data in results.values()
+            if data is not None
+        ]
+
+        if not valid_results:
+            raise HTTPException(status_code=404, detail="No valid tracks found")
+
+        # Add token refresh to background tasks if needed
+        background_tasks.add_task(refresh_token_task)
+
+        return valid_results
+        
+    except Exception as e:
+        logger.error(f"Error fetching tracks: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
