@@ -1,0 +1,311 @@
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+import random
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi_utils.tasks import repeat_every
+from pydantic import BaseModel
+from typing import List, Dict, Optional
+from .spotify import SpotifyAPI
+from .database import AsyncDatabase
+from .cache import RedisCache
+import asyncio
+import logging
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+class PlaylistRequest(BaseModel):
+    ids: List[str]
+    with_tracks: Optional[bool] = False
+
+app = FastAPI()
+spotify_api = SpotifyAPI()
+redis_cache = RedisCache()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+async def refresh_token_task():
+    """Token refresh task with proper error handling"""
+    try:
+        # Only refresh if we can acquire the lock
+        if await redis_cache.acquire_lock():
+            try:
+                await spotify_api.refresh_token()
+            finally:
+                await redis_cache.release_lock()
+        else:
+            logger.info("Token refresh already in progress by another worker")
+    except Exception as e:
+        logger.error(f"Token refresh error: {str(e)}")
+        raise
+
+@app.on_event("startup")
+@repeat_every(seconds=300)  # Run every 5 minutes
+async def scheduled_token_refresh():
+    await refresh_token_task()
+
+@app.on_event("startup")
+@repeat_every(seconds=3600)  # Run every hour
+async def scheduled_cleanup():
+    """Run database cleanup every hour with error handling and logging"""
+    try:
+        logger.info(f"Starting scheduled cleanup at {datetime.now()}")
+        db = AsyncDatabase()
+
+        # Add jitter to prevent all instances cleaning up simultaneously
+        jitter = random.uniform(0, 60)  # Random delay between 0-60 seconds
+        await asyncio.sleep(jitter)
+
+        start_time = datetime.now()
+        await db.cleanup_old_records()
+        duration = (datetime.now() - start_time).total_seconds()
+
+        logger.info(f"Completed cleanup in {duration:.2f} seconds")
+
+    except Exception as e:
+        logger.error(f"Error in scheduled cleanup: {e}")
+        # Don't raise the error - we want the scheduler to continue running
+
+@app.on_event("startup")
+@repeat_every(seconds=300)  # Run every 5 minutes
+async def scheduled_browser_cleanup():
+    """Periodic task to clean up any orphaned browser processes"""
+    from .browser_cleanup import cleanup_browsers  # Import the new cleanup function
+    await cleanup_browsers()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Shutting down application...")
+    await spotify_api.close()
+
+@app.get("/api/playlist/{playlist_id}")
+async def get_playlist(
+    playlist_id: str,
+    background_tasks: BackgroundTasks,
+    with_tracks: bool = False
+):
+    """Get a single playlist by ID"""
+    logger.info(f"Fetching playlist {playlist_id} with_tracks={with_tracks}")
+    try:
+        # First try to get the playlist
+        logger.info("Calling spotify_api.get_playlists")
+        results = await spotify_api.get_playlists([playlist_id], with_tracks=with_tracks, skip_cache=True)
+        logger.info(f"Results from get_playlists: {type(results)}")
+        logger.info(f"Results content: {results}")
+
+        if not results:
+            logger.info("No results returned")
+            raise HTTPException(status_code=404, detail="Playlist not found")
+
+        # Safely handle dictionary access
+        playlist = None
+        try:
+            playlist = results.get(playlist_id)
+        except AttributeError as e:
+            logger.error(f"Results is not a dictionary: {type(results)}")
+            logger.error(f"Results content: {results}")
+            raise HTTPException(status_code=500, detail="Invalid response format")
+
+        if not playlist:
+            logger.info("Playlist not found in results")
+            raise HTTPException(status_code=404, detail="Playlist not found")
+
+        logger.info(f"Returning playlist type: {type(playlist)}")
+        logger.info(f"Playlist content: {playlist}")
+
+        # Schedule token refresh for next request if needed
+        background_tasks.add_task(refresh_token_task)
+
+        return playlist
+
+    except Exception as e:
+        logger.error(f"Error fetching playlist {playlist_id}: {e}")
+        logger.error(f"Error type: {type(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/playlists")
+async def get_playlists(
+    request: PlaylistRequest,
+    background_tasks: BackgroundTasks
+):
+    """Get multiple playlists by their IDs"""
+    try:
+        if not request.ids:
+            raise HTTPException(status_code=400, detail="No playlist IDs provided")
+
+        if len(request.ids) > 100:
+            raise HTTPException(status_code=400, detail="Maximum 100 playlist IDs per request")
+ 
+        results = await spotify_api.get_playlists(request.ids, with_tracks=request.with_tracks)
+
+        # Convert to array and filter out None values
+        valid_results = [
+            data
+            for data in results.values()
+            if data is not None
+        ]
+
+        if not valid_results:
+            raise HTTPException(status_code=404, detail="No valid playlists found")
+
+        # Add token refresh to background tasks if needed
+        background_tasks.add_task(refresh_token_task)
+
+        return valid_results
+    except Exception as e:
+        logger.error(f"Error fetching playlists: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+class ArtistRequest(BaseModel):
+    ids: List[str]
+
+@app.get("/api/artist/{artist_id}")
+async def get_artist(
+    artist_id: str,
+    background_tasks: BackgroundTasks
+):
+    """Get a single artist by ID"""
+    logger.info(f"Starting artist fetch for ID: {artist_id}")
+    try:
+        # First try to get the artist
+        logger.info(f"Calling spotify_api.get_artists for {artist_id}")
+        results = await spotify_api.get_artists([artist_id], skip_cache=True)
+        logger.info(f"Results type from get_artists: {type(results)}")
+        logger.info(f"Results content: {results}")
+
+        if not results:
+            logger.warning(f"No results returned for artist {artist_id}")
+            raise HTTPException(status_code=404, detail="Artist not found")
+
+        # Safely handle dictionary access
+        artist = None
+        try:
+            artist = results.get(artist_id)
+            logger.info(f"Artist data retrieved for {artist_id}: {artist is not None}")
+            if artist:
+                logger.info(f"Artist data fields: {list(artist.keys()) if isinstance(artist, dict) else 'Not a dict'}")
+        except AttributeError as e:
+            logger.error(f"Results is not a dictionary. Type: {type(results)}")
+            logger.error(f"Results content: {results}")
+            raise HTTPException(status_code=500, detail="Invalid response format")
+
+        if not artist:
+            logger.warning(f"Artist {artist_id} not found in results dictionary")
+            raise HTTPException(status_code=404, detail="Artist not found")
+
+        logger.info(f"Returning artist type: {type(artist)}")
+        logger.debug(f"Artist content: {artist}")
+
+        # Schedule token refresh for next request if needed
+        background_tasks.add_task(refresh_token_task)
+
+        return artist
+
+    except Exception as e:
+        logger.error(f"Error fetching artist {artist_id}: {e}")
+        logger.error(f"Error type: {type(e)}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/artists")
+async def get_artists(
+    request: ArtistRequest,
+    background_tasks: BackgroundTasks
+):
+    """Get multiple artists by their IDs"""
+    try:
+        if not request.ids:
+            raise HTTPException(status_code=400, detail="No artist IDs provided")
+
+        if len(request.ids) > 100:
+            raise HTTPException(status_code=400, detail="Maximum 100 artist IDs per request")
+ 
+        results = await spotify_api.get_artists(request.ids)
+
+        # Convert to array and filter out None values
+        valid_results = [
+            data
+            for data in results.values()
+            if data is not None
+        ]
+
+        if not valid_results:
+            raise HTTPException(status_code=404, detail="No valid artists found")
+
+        # Add token refresh to background tasks if needed
+        background_tasks.add_task(refresh_token_task)
+
+        return valid_results
+        
+    except Exception as e:
+        logger.error(f"Error fetching artists: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+class DiscoveredRequest(BaseModel):
+    ids: List[str]
+
+@app.get("/api/discovered-on/{artist_id}")
+async def get_discovered_on(
+    artist_id: str,
+    background_tasks: BackgroundTasks
+):
+    """Get discovered-on data for a single artist"""
+    logger.info(f"Starting discovered-on fetch for ID: {artist_id}")
+    try:
+        results = await spotify_api.get_discovered_on([artist_id], skip_cache=True)
+
+        if not results:
+            raise HTTPException(status_code=404, detail="Artist not found")
+
+        artist_data = results.get(artist_id)
+        if not artist_data:
+            raise HTTPException(status_code=404, detail="Artist not found")
+
+        # Schedule token refresh for next request if needed
+        background_tasks.add_task(refresh_token_task)
+
+        return artist_data
+
+    except Exception as e:
+        logger.error(f"Error fetching discovered-on {artist_id}: {e}")
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/discovered-on")
+async def get_multiple_discovered_on(
+    request: DiscoveredRequest,
+    background_tasks: BackgroundTasks
+):
+    """Get discovered-on data for multiple artists"""
+    try:
+        if not request.ids:
+            raise HTTPException(status_code=400, detail="No artist IDs provided")
+
+        if len(request.ids) > 100:
+            raise HTTPException(status_code=400, detail="Maximum 100 artist IDs per request")
+
+        results = await spotify_api.get_discovered_on(request.ids)
+
+        if not results:
+            raise HTTPException(status_code=404, detail="No valid artists found")
+
+        # Add token refresh to background tasks if needed
+        background_tasks.add_task(refresh_token_task)
+
+        return list(results.values())
+
+    except Exception as e:
+        logger.error(f"Error fetching discovered-on: {e}")
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail="Internal server error")
