@@ -139,10 +139,8 @@ async def get_playlists(
         if not request.ids:
             raise HTTPException(status_code=400, detail="No playlist IDs provided")
 
-        if len(request.ids) > 100:
-            raise HTTPException(status_code=400, detail="Maximum 100 playlist IDs per request")
- 
-        results = await spotify_api.get_playlists(request.ids, with_tracks=request.with_tracks)
+        playlist_ids = request.ids[:200]
+        results = await spotify_api.get_playlists(playlist_ids, with_tracks=request.with_tracks)
 
         # Convert to array and filter out None values
         valid_results = [
@@ -231,10 +229,8 @@ async def get_artists(
         if not request.ids:
             raise HTTPException(status_code=400, detail="No artist IDs provided")
 
-        if len(request.ids) > 100:
-            raise HTTPException(status_code=400, detail="Maximum 100 artist IDs per request")
-
-        results = await spotify_api.get_artists(request.ids, detail=request.detail)
+        artist_ids = request.ids[:200]
+        results = await spotify_api.get_artists(artist_ids, detail=request.detail)
 
         # Convert to array and filter out None values
         valid_results = [
@@ -296,10 +292,8 @@ async def get_multiple_discovered_on(
         if not request.ids:
             raise HTTPException(status_code=400, detail="No artist IDs provided")
 
-        if len(request.ids) > 100:
-            raise HTTPException(status_code=400, detail="Maximum 100 artist IDs per request")
-
-        results = await spotify_api.get_discovered_on(request.ids)
+        discovered_on_ids = request.ids[:200]
+        results = await spotify_api.get_discovered_on(discovered_on_ids)
 
         if not results:
             raise HTTPException(status_code=404, detail="No valid artists found")
@@ -384,10 +378,8 @@ async def get_tracks(
         if not request.ids:
             raise HTTPException(status_code=400, detail="No track IDs provided")
 
-        if len(request.ids) > 100:
-            raise HTTPException(status_code=400, detail="Maximum 100 track IDs per request")
- 
-        results = await spotify_api.get_tracks(request.ids)
+        track_ids = request.ids[:200]
+        results = await spotify_api.get_tracks(track_ids)
 
         # Convert to array and filter out None values
         valid_results = [
