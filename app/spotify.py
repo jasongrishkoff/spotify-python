@@ -144,9 +144,13 @@ class SpotifyAPI:
         finally:
             if browser:
                 try:
-                    # Force close all pages
-                    pages = await browser.pages()
-                    await asyncio.gather(*[page.close() for page in pages])
+                    # Create a new context and close any pages
+                    context = await browser.new_context()
+                    # Access pages as a property, not a method
+                    pages = context.pages
+                    if pages:
+                        await asyncio.gather(*[page.close() for page in pages])
+                    await context.close()
                     await browser.close()
                     logger.info("Browser cleanup completed")
                 except Exception as e:
@@ -586,14 +590,18 @@ class SpotifyAPI:
 
             url = "https://api-partner.spotify.com/pathfinder/v1/query"
 
+            # Updated variables to include required fields
+            variables = {
+                'uri': f'spotify:artist:{artist_id}',
+                'locale': '',
+                'includePrerelease': False,
+                'enableAssociatedVideos': False,
+                'withSaved': True  # Add this field to ensure saved is not null
+            }
+
             params = {
                 'operationName': 'queryArtistOverview',
-                'variables': json.dumps({
-                    'uri': f'spotify:artist:{artist_id}',
-                    'locale': '',
-                    'includePrerelease': False,
-                    'enableAssociatedVideos': False
-                }),
+                'variables': json.dumps(variables),
                 'extensions': json.dumps({
                     'persistedQuery': {
                         'version': 1,
@@ -618,8 +626,14 @@ class SpotifyAPI:
                     data = await response.json()
 
                     if 'errors' in data:
-                        logger.error(f"GraphQL errors in response: {data['errors']}")
-                        return None
+                        error_msg = data.get('errors', [{}])[0].get('message', '')
+                        if 'NullValueInNonNullableField' in error_msg:
+                            # Handle the specific error by providing a default value
+                            if 'data' in data and 'artistUnion' in data['data']:
+                                data['data']['artistUnion']['saved'] = False
+                        else:
+                            logger.error(f"GraphQL errors in response: {data['errors']}")
+                            return None
 
                     return data
 
@@ -886,10 +900,27 @@ class SpotifyAPI:
         }
 
     async def _get_discovered_hash(self) -> Optional[str]:
-        """Get the discovered-on hash by monitoring actual Spotify web requests"""
-        logger.info("Getting discovered-on hash from live request")
+        """Get the discovered-on hash with proper locking and caching"""
+        logger.info("Getting discovered-on hash")
+
+        # Try to get from cache first
+        if cached_hash := await self.cache.get_discovered_hash():
+            logger.info("Using cached discovered-on hash")
+            return cached_hash
+
+        # If not in cache, try to acquire lock
+        if not await self.cache.acquire_lock('discovered', timeout=60):  # Increased timeout
+            logger.info("Waiting for discovered hash to be generated")
+            for _ in range(60):  # Increased wait time
+                if cached_hash := await self.cache.get_discovered_hash():
+                    logger.info("Got cached hash while waiting")
+                    return cached_hash
+                await asyncio.sleep(1)
+            logger.error("Timeout waiting for discovered hash")
+            return None
 
         try:
+            logger.info("Starting hash capture process")
             if not self.proxy:
                 self.proxy = await self._get_proxy()
             if not self.proxy:
@@ -899,53 +930,82 @@ class SpotifyAPI:
             async with self._browser_session() as browser:
                 context = await browser.new_context()
                 page = await context.new_page()
-
                 discovered_hash = None
 
-                # Monitor network requests
                 async def handle_request(request):
                     nonlocal discovered_hash
-                    url = request.url
-                    if 'queryArtistDiscoveredOn' in url:
-                        logger.info(f"Found queryArtistDiscoveredOn request: {url}")
-                        # Parse URL similar to Node.js version
-                        try:
-                            parts = url.split('=')
+                    try:
+                        url = request.url
+                        if 'queryArtistDiscoveredOn' in url:
+                            logger.info(f"Found queryArtistDiscoveredOn request: {url[:100]}...")
+                            parts = urllib.parse.urlparse(url).query.split('&')
                             for part in parts:
+                                if 'extensions=' in part:
+                                    decoded = urllib.parse.unquote(part.split('=')[1])
+                                    data = json.loads(decoded)
+                                    if hash_value := data.get('persistedQuery', {}).get('sha256Hash'):
+                                        discovered_hash = hash_value
+                                        logger.info(f"Successfully extracted hash: {hash_value}")
+                                        return
+                    except Exception as e:
+                        logger.error(f"Error in request handler: {e}")
+                    await request.continue_()
+
+                # Set up request interception
+                await page.route("**/*", handle_request)
+
+                try:
+                    logger.info("Navigating to artist page")
+                    await page.goto(
+                        'https://open.spotify.com/artist/3GBPw9NK25X1Wt2OUvOwY3/discovered-on',
+                        timeout=60000,
+                        wait_until='networkidle'
+                    )
+
+                    # Additional wait and scroll to trigger requests
+                    await page.wait_for_timeout(5000)
+                    await page.evaluate("window.scrollBy(0, 500)")
+                    await page.wait_for_timeout(5000)
+
+                    if not discovered_hash:
+                        # Try getting it from network requests directly
+                        requests = await page.context.all_requests()
+                        for request in requests:
+                            if 'queryArtistDiscoveredOn' in request.url:
+                                url = request.url
+                                logger.info(f"Found request in history: {url[:100]}...")
                                 try:
-                                    data = json.loads(urllib.parse.unquote(part))
-                                    if data.get('persistedQuery', {}).get('sha256Hash'):
-                                        discovered_hash = data['persistedQuery']['sha256Hash']
-                                        logger.info(f"Found hash: {discovered_hash}")
-                                except json.JSONDecodeError:
-                                    continue
-                        except Exception as e:
-                            logger.error(f"Error parsing URL: {e}")
+                                    parts = urllib.parse.urlparse(url).query.split('&')
+                                    for part in parts:
+                                        if 'extensions=' in part:
+                                            decoded = urllib.parse.unquote(part.split('=')[1])
+                                            data = json.loads(decoded)
+                                            if hash_value := data.get('persistedQuery', {}).get('sha256Hash'):
+                                                discovered_hash = hash_value
+                                                logger.info(f"Got hash from request history: {hash_value}")
+                                                break
+                                except Exception as e:
+                                    logger.error(f"Error parsing request history: {e}")
 
-                # Listen to network requests
-                page.on("request", handle_request)
-
-                # Visit a known artist page
-                artist_id = "3GBPw9NK25X1Wt2OUvOwY3"  # Same as Node.js version
-                await page.goto(f'https://open.spotify.com/artist/{artist_id}/discovered-on', timeout=60000)
-                await page.wait_for_load_state('networkidle', timeout=30000)
-
-                # Wait a bit to ensure we capture the request
-                await asyncio.sleep(5)
+                except Exception as e:
+                    logger.error(f"Navigation error: {e}")
+                    return None
 
                 if discovered_hash:
-                    # Save the hash in Redis for future use
+                    logger.info("Saving discovered hash to cache")
                     await self.cache.save_discovered_hash(discovered_hash)
                     return discovered_hash
-                else:
-                    logger.error("Failed to capture discovered-on hash")
-                    return None
+
+                logger.error("Failed to capture discovered-on hash")
+                return None
 
         except Exception as e:
             logger.error(f"Error getting discovered-on hash: {e}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
             return None
+        finally:
+            await self.cache.release_lock('discovered')
 
     async def _get_track_token(self) -> bool:
         """Get a new track token using browser automation."""

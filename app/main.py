@@ -80,6 +80,7 @@ async def scheduled_browser_cleanup():
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("Shutting down application...")
+    await cleanup_browsers()
     await spotify_api.close()
 
 @app.get("/api/playlist/{playlist_id}")
