@@ -106,7 +106,6 @@ class SpotifyAPI:
         if self.proxy:
             return self.proxy
 
-        logger.info("Getting new proxy...")
         try:
             if not self.session:
                 self.session = aiohttp.ClientSession()
@@ -160,27 +159,22 @@ class SpotifyAPI:
         if token_type == 'track':
             # Quick check if we already have a valid token
             if self.access_token and hasattr(self, 'track_hash'):
-                logger.info("Using existing track token")
                 return True
 
             # Try to get token from Redis first
             if cached := await self.cache.get_token('track'):
-                logger.info("Found cached track token in Redis")
                 cached_time = cached['proxy'].get('created_at', 0)
                 current_time = int(time.time())
 
                 # Only use cached token if it's less than 8 minutes old
                 if current_time - cached_time < 480:  # 8 minutes
-                    logger.info("Using valid cached track token")
                     self.access_token = cached['access_token']
                     self.track_hash = cached.get('hash_value')
                     self.proxy = ProxyConfig(**cached['proxy'])
                     return True
-                logger.info("Cached track token expired")
 
             # Get new track token
             if not await self.cache.acquire_lock('track', timeout=30):
-                logger.info("Another process is refreshing track token, waiting...")
                 # Wait for up to 30 seconds for new token
                 for _ in range(30):
                     if cached := await self.cache.get_token('track'):
@@ -189,7 +183,6 @@ class SpotifyAPI:
                         self.proxy = ProxyConfig(**cached['proxy'])
                         return True
                     await asyncio.sleep(1)
-                logger.error("Timeout waiting for track token refresh")
                 return False
 
             try:
@@ -204,18 +197,15 @@ class SpotifyAPI:
 
         # Quick check if we already have a valid token
         if self.access_token:
-            logger.info("Using existing access token")
             return True
 
         # Try to get token from Redis first
         if cached := await self.cache.get_token(token_type):
-            logger.info("Found cached auth in Redis")
             cached_time = cached['proxy'].get('created_at', 0)
             current_time = int(time.time())
 
             # Only use cached token if it's less than 8 minutes old
             if current_time - cached_time < 480:  # 8 minutes
-                logger.info("Using valid cached token")
                 self.access_token = cached['access_token']
                 self.proxy = ProxyConfig(**cached['proxy'])
                 if token_type == 'artist':
@@ -225,7 +215,6 @@ class SpotifyAPI:
 
         # Attempt to acquire lock for token refresh
         if not await self.cache.acquire_lock(token_type, timeout=30):
-            logger.info("Another process is refreshing token, waiting...")
             # Wait for up to 30 seconds for new token
             for i in range(30):
                 if cached := await self.cache.get_token(token_type):
@@ -729,9 +718,6 @@ class SpotifyAPI:
                 'locale': ''
             }
 
-            logger.info(f"Query variables: {variables}")
-            logger.info(f"Using discovered hash: {discovered_hash}")
-
             params = {
                 'operationName': 'queryArtistDiscoveredOn',
                 'variables': json.dumps(variables),
@@ -742,11 +728,6 @@ class SpotifyAPI:
                     }
                 })
             }
-
-            logger.info(f"Request URL: {url}")
-            logger.info(f"Request params: {params}")
-            logger.info(f"Using proxy: {self.proxy.url}")
-            logger.info(f"Access token: {self.access_token[:10]}...")
 
             async with self.session.get(
                 url,
@@ -760,12 +741,9 @@ class SpotifyAPI:
                 proxy_auth=self.proxy.auth,
                 timeout=10
             ) as response:
-                logger.info(f"Response status: {response.status}")
-                logger.info(f"Response headers: {dict(response.headers)}")
 
                 if response.status == 200:
                     data = await response.json()
-                    logger.info(f"Response data structure: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
 
                     if 'errors' in data:
                         logger.error(f"GraphQL errors in response: {data['errors']}")
@@ -1160,14 +1138,14 @@ class SpotifyAPI:
         try:
             await self.rate_limiter.acquire()
 
-            logger.info(f"Fetching track {track_id} (detail={detail})")
+            #logger.info(f"Fetching track {track_id} (detail={detail})")
 
             if not await self._ensure_auth('track'):
                 logger.error("Failed to get track auth token")
                 return None
 
-            logger.info(f"Using track token: {self.access_token[:20]}...")
-            logger.info(f"Using track hash: {getattr(self, 'track_hash', 'None')}")
+            #logger.info(f"Using track token: {self.access_token[:20]}...")
+            #logger.info(f"Using track hash: {getattr(self, 'track_hash', 'None')}")
 
             if not self.session:
                 self.session = aiohttp.ClientSession()
@@ -1195,8 +1173,8 @@ class SpotifyAPI:
                 'extensions': json.dumps(extensions)
             }
 
-            logger.info(f"Track request URL: {url}")
-            logger.info(f"Track request params: {params}")
+            #logger.info(f"Track request URL: {url}")
+            #logger.info(f"Track request params: {params}")
 
             async with self.session.get(
                 url,
@@ -1210,10 +1188,10 @@ class SpotifyAPI:
                 proxy_auth=self.proxy.auth,
                 timeout=10
             ) as response:
-                logger.info(f"Track response status: {response.status}")
+                #logger.info(f"Track response status: {response.status}")
 
                 response_text = await response.text()
-                logger.info(f"Track response text: {response_text[:200]}...")
+                #logger.info(f"Track response text: {response_text[:200]}...")
 
                 if response.status == 200:
                     data = json.loads(response_text)
@@ -1252,7 +1230,7 @@ class SpotifyAPI:
     @staticmethod
     def _format_track(track_data: Dict, detail: bool = False) -> Optional[Dict]:
         """Format a track response from Spotify Partner API"""
-        logger.info(f"Formatting track data structure: {list(track_data.keys()) if isinstance(track_data, dict) else 'Not a dict'}")
+        #logger.info(f"Formatting track data structure: {list(track_data.keys()) if isinstance(track_data, dict) else 'Not a dict'}")
 
         # For detail view, return the trackUnion data directly
         if detail:
@@ -1272,14 +1250,14 @@ class SpotifyAPI:
             for artist in track['firstArtist']['items']:
                 if artist.get('id'):
                     artist_ids.append(artist['id'])
-                    logger.info(f"Found artist ID from firstArtist: {artist['id']}")
+                    #logger.info(f"Found artist ID from firstArtist: {artist['id']}")
 
         # Get artists from otherArtists
         if track.get('otherArtists', {}).get('items'):
             for artist in track['otherArtists']['items']:
                 if artist.get('id'):
                     artist_ids.append(artist['id'])
-                    logger.info(f"Found artist ID from otherArtists: {artist['id']}")
+                    #logger.info(f"Found artist ID from otherArtists: {artist['id']}")
 
         # Basic track data
         formatted_data = {
@@ -1290,7 +1268,7 @@ class SpotifyAPI:
             'duration': track.get('duration', {}).get('totalMilliseconds'),
         }
 
-        logger.info(f"Formatted track data: {formatted_data}")
+        #logger.info(f"Formatted track data: {formatted_data}")
 
         if not formatted_data.get('id'):
             logger.error("No track ID in formatted data")

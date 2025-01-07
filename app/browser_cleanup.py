@@ -6,36 +6,54 @@ from playwright.async_api import async_playwright
 logger = logging.getLogger(__name__)
 
 async def cleanup_browsers():
-    """
-    Clean up any orphaned browser processes with proper error handling.
-    This version handles both Playwright browser instances and orphaned processes.
-    """
+    """Clean up any orphaned browser processes"""
     try:
-        # First try to close any active Playwright browsers gracefully
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp('http://localhost:9222')
+        async with async_playwright() as p:
+            try:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=['--no-sandbox']
+                )
                 if browser:
-                    for context in browser.contexts:
-                        for page in context.pages:
-                            await page.close()
+                    contexts = browser.contexts
+                    for context in contexts:
+                        pages = await context.pages
+                        if pages:
+                            for page in pages:
+                                await page.close()
                         await context.close()
                     await browser.close()
-        except Exception as browser_e:
-            logger.debug(f"No active browser sessions to close: {browser_e}")
-
-        # Then clean up any remaining browser processes
-        for proc in psutil.process_iter(['name', 'cmdline']):
-            try:
-                proc_info = proc.info
-                if any(browser_process in str(proc_info.get('name', '')).lower() 
-                       for browser_process in ['chrome', 'chromium', 'playwright']):
-                    logger.info(f"Killing browser process: {proc.pid}")
-                    proc.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
-                logger.debug(f"Could not access process {proc}: {e}")
             except Exception as e:
-                logger.error(f"Error handling process {proc}: {e}")
+                logger.error(f"Error in graceful browser cleanup: {e}")
+
+        # Force cleanup of remaining processes
+        chrome_processes = []
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if any(browser in proc.info['name'].lower() 
+                      for browser in ['chrome', 'chromium']):
+                    if any(arg for arg in (proc.info['cmdline'] or [])
+                          if '--headless' in str(arg)):
+                        chrome_processes.append(proc)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        for proc in chrome_processes:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except psutil.TimeoutExpired:
+                    proc.kill()
+            except psutil.NoSuchProcess:
+                continue
+            except Exception as e:
+                logger.error(f"Error killing process {proc.pid}: {e}")
+
+        if chrome_processes:
+            logger.info(f"Cleaned up {len(chrome_processes)} chrome processes")
 
     except Exception as e:
-        logger.error(f"Error during browser cleanup: {e}")
+        logger.error(f"Error in browser cleanup: {e}")
+        import traceback
+        logger.error(f"Cleanup traceback: {traceback.format_exc()}")

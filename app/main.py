@@ -89,16 +89,11 @@ async def get_playlist(
     with_tracks: bool = False
 ):
     """Get a single playlist by ID"""
-    logger.info(f"Fetching playlist {playlist_id} with_tracks={with_tracks}")
     try:
         # First try to get the playlist
-        logger.info("Calling spotify_api.get_playlists")
         results = await spotify_api.get_playlists([playlist_id], with_tracks=with_tracks, skip_cache=True)
-        logger.info(f"Results from get_playlists: {type(results)}")
-        logger.info(f"Results content: {results}")
 
         if not results:
-            logger.info("No results returned")
             raise HTTPException(status_code=404, detail="Playlist not found")
 
         # Safely handle dictionary access
@@ -106,16 +101,10 @@ async def get_playlist(
         try:
             playlist = results.get(playlist_id)
         except AttributeError as e:
-            logger.error(f"Results is not a dictionary: {type(results)}")
-            logger.error(f"Results content: {results}")
             raise HTTPException(status_code=500, detail="Invalid response format")
 
         if not playlist:
-            logger.info("Playlist not found in results")
             raise HTTPException(status_code=404, detail="Playlist not found")
-
-        logger.info(f"Returning playlist type: {type(playlist)}")
-        logger.info(f"Playlist content: {playlist}")
 
         # Schedule token refresh for next request if needed
         background_tasks.add_task(refresh_token_task)
@@ -174,13 +163,9 @@ async def get_artist(
     Get a single artist by ID.
     Optionally return detailed data when detail=true
     """
-    logger.info(f"Starting artist fetch for ID: {artist_id} with detail={detail}")
     try:
         # First try to get the artist
-        logger.info(f"Calling spotify_api.get_artists for {artist_id}")
         results = await spotify_api.get_artists([artist_id], skip_cache=True, detail=detail)
-        logger.info(f"Results type from get_artists: {type(results)}")
-        logger.info(f"Results content: {results}")
 
         if not results:
             logger.warning(f"No results returned for artist {artist_id}")
@@ -190,9 +175,6 @@ async def get_artist(
         artist = None
         try:
             artist = results.get(artist_id)
-            logger.info(f"Artist data retrieved for {artist_id}: {artist is not None}")
-            if artist:
-                logger.info(f"Artist data fields: {list(artist.keys()) if isinstance(artist, dict) else 'Not a dict'}")
         except AttributeError as e:
             logger.error(f"Results is not a dictionary. Type: {type(results)}")
             logger.error(f"Results content: {results}")
@@ -201,9 +183,6 @@ async def get_artist(
         if not artist:
             logger.warning(f"Artist {artist_id} not found in results dictionary")
             raise HTTPException(status_code=404, detail="Artist not found")
-
-        logger.info(f"Returning artist type: {type(artist)}")
-        logger.debug(f"Artist content: {artist}")
 
         # Schedule token refresh for next request if needed
         background_tasks.add_task(refresh_token_task)
@@ -260,7 +239,6 @@ async def get_discovered_on(
     background_tasks: BackgroundTasks
 ):
     """Get discovered-on data for a single artist"""
-    logger.info(f"Starting discovered-on fetch for ID: {artist_id}")
     try:
         results = await spotify_api.get_discovered_on([artist_id], skip_cache=True)
 
@@ -318,7 +296,6 @@ async def get_track(
     background_tasks: BackgroundTasks
 ):
     """Get a single track by ID"""
-    logger.info(f"Starting track fetch for ID: {track_id}")
     try:
         results = await spotify_api.get_tracks([track_id], skip_cache=True)
 
@@ -346,7 +323,6 @@ async def get_track_detail(
     background_tasks: BackgroundTasks
 ):
     """Get detailed track information by ID"""
-    logger.info(f"Starting detailed track fetch for ID: {track_id}")
     try:
         results = await spotify_api.get_tracks([track_id], skip_cache=True, detail=True)
 
