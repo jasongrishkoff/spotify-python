@@ -124,6 +124,7 @@ class SpotifyAPI:
     async def _browser_session(self, retry_count: int = 0):
         """Managed browser session with proper cleanup"""
         browser = None
+        context = None
         try:
             logger.info(f"Starting browser (attempt {retry_count + 1}/{self.MAX_RETRIES})")
             async with async_playwright() as p:
@@ -137,109 +138,57 @@ class SpotifyAPI:
                         '--single-process',
                     ]
                 )
+                # Create the context immediately after launching the browser
+                context = await browser.new_context()
                 yield browser
         except Exception as e:
             logger.error(f"Browser session error: {str(e)}")
             raise
         finally:
-            if browser:
-                try:
-                    # Create a new context and close any pages
-                    context = await browser.new_context()
-                    # Access pages as a property, not a method
-                    pages = context.pages
-                    if pages:
-                        await asyncio.gather(*[page.close() for page in pages])
+            try:
+                if context:
+                    # Close context first - this will automatically close all associated pages
                     await context.close()
+                if browser:
                     await browser.close()
-                    logger.info("Browser cleanup completed")
-                except Exception as e:
-                    logger.error(f"Error during browser cleanup: {str(e)}")
+                logger.info("Browser cleanup completed")
+            except Exception as e:
+                logger.error(f"Error during browser cleanup: {str(e)}")
 
     async def _ensure_auth(self, token_type: str = 'playlist') -> bool:
-        """Ensures authentication token is valid, with proper locking and caching."""
-
-        # For track tokens, use separate method
-        if token_type == 'track':
-            # Quick check if we already have a valid token
-            if self.access_token and hasattr(self, 'track_hash'):
-                return True
-
-            # Try to get token from Redis first
-            if cached := await self.cache.get_token('track'):
-                cached_time = cached['proxy'].get('created_at', 0)
-                current_time = int(time.time())
-
-                # Only use cached token if it's less than 8 minutes old
-                if current_time - cached_time < 480:  # 8 minutes
-                    self.access_token = cached['access_token']
-                    self.track_hash = cached.get('hash_value')
-                    self.proxy = ProxyConfig(**cached['proxy'])
-                    return True
-
-            # Get new track token
-            if not await self.cache.acquire_lock('track', timeout=30):
-                # Wait for up to 30 seconds for new token
-                for _ in range(30):
-                    if cached := await self.cache.get_token('track'):
-                        self.access_token = cached['access_token']
-                        self.track_hash = cached.get('hash_value')
-                        self.proxy = ProxyConfig(**cached['proxy'])
-                        return True
-                    await asyncio.sleep(1)
-                return False
-
-            try:
-                success = await self._get_track_token()
-                if success:
-                    logger.info("Track token refresh successful")
-                    return True
-                logger.error("Track token refresh failed")
-                return False
-            finally:
-                await self.cache.release_lock('track')
-
         # Quick check if we already have a valid token
-        if self.access_token:
-            return True
-
-        # Try to get token from Redis first
         if cached := await self.cache.get_token(token_type):
             cached_time = cached['proxy'].get('created_at', 0)
             current_time = int(time.time())
 
-            # Only use cached token if it's less than 8 minutes old
             if current_time - cached_time < 480:  # 8 minutes
                 self.access_token = cached['access_token']
                 self.proxy = ProxyConfig(**cached['proxy'])
-                if token_type == 'artist':
-                    self.artist_hash = cached.get('artist_hash')
                 return True
-            logger.info(f"Cached token expired. Age: {current_time - cached_time} seconds")
 
-        # Attempt to acquire lock for token refresh
-        if not await self.cache.acquire_lock(token_type, timeout=30):
-            # Wait for up to 30 seconds for new token
-            for i in range(30):
-                if cached := await self.cache.get_token(token_type):
-                    logger.info(f"Got new token while waiting (attempt {i+1})")
-                    self.access_token = cached['access_token']
-                    self.proxy = ProxyConfig(**cached['proxy'])
-                    return True
-                await asyncio.sleep(1)
-            logger.error("Timeout waiting for token refresh")
-            return False
+        # Use exponential backoff for waiting
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            if await self.cache.acquire_lock(token_type, timeout=30):
+                try:
+                    success = await self._get_token(token_type)
+                    if success:
+                        return True
+                    logger.error("Token refresh failed")
+                finally:
+                    await self.cache.release_lock(token_type)
 
-        try:
-            logger.info("Starting token refresh")
-            success = await self._get_token(token_type)
-            if success:
-                logger.info("Token refresh successful")
+            # Exponential backoff wait
+            wait_time = min(2 ** attempt, 8)  # Max 8 second wait
+            await asyncio.sleep(wait_time)
+
+            # Check if another process refreshed the token
+            if cached := await self.cache.get_token(token_type):
+                self.access_token = cached['access_token']
+                self.proxy = ProxyConfig(**cached['proxy'])
                 return True
-            logger.error("Token refresh failed")
-            return False
-        finally:
-            await self.cache.release_lock(token_type)
+
+        return False
 
     async def _get_token(self, token_type: str = 'playlist') -> bool:
         """
@@ -491,10 +440,9 @@ class SpotifyAPI:
 
         return base_data
 
-    async def refresh_token(self) -> bool:
+    async def refresh_token(self, token_type: str = 'playlist') -> bool:
         """Background task to refresh token if existing token is > 5 minutes old"""
-        if cached := await self.cache.get_token():
-            # Cached data is already parsed from JSON by RedisCache
+        if cached := await self.cache.get_token(token_type):
             proxy_data = cached['proxy']
             if isinstance(proxy_data, str):
                 proxy_data = json.loads(proxy_data)
@@ -503,7 +451,11 @@ class SpotifyAPI:
             if int(time.time()) - proxy_data.get('created_at', 0) < 300:
                 return True
 
-        return await self._get_token()
+        # Use appropriate token getter based on type
+        if token_type == 'track':
+            return await self._get_track_token()
+        else:
+            return await self._get_token(token_type)
 
     async def get_artists(
         self,
@@ -632,7 +584,7 @@ class SpotifyAPI:
                             if 'data' in data and 'artistUnion' in data['data']:
                                 data['data']['artistUnion']['saved'] = False
                         else:
-                            logger.error(f"GraphQL errors in response: {data['errors']}")
+                            #logger.error(f"GraphQL errors in response: {data['errors']}")
                             return None
 
                     return data
@@ -701,22 +653,18 @@ class SpotifyAPI:
         return formatted_data
 
     async def _fetch_discovered_on(self, artist_id: str) -> Optional[Dict]:
-        """Fetch discovered-on data from Spotify Partner API"""
         try:
             await self.rate_limiter.acquire()
 
-            if not await self._ensure_auth():
+            if not await self._ensure_auth('artist'):  # Use artist token type
                 logger.error("Failed to get auth token")
                 return None
-
-            # Get the hash from Redis or capture it if needed
-            discovered_hash = await self.cache.get_discovered_hash()
+                
+            # Use the helper method to get the hash
+            discovered_hash = await self._ensure_discovered_hash()
             if not discovered_hash:
-                logger.info("No cached hash found, capturing from live request")
-                discovered_hash = await self._get_discovered_hash()
-                if not discovered_hash:
-                    logger.error("Failed to get discovered-on hash")
-                    return None
+                logger.error("Could not get discovered-on hash")
+                return None
 
             if not self.session:
                 self.session = aiohttp.ClientSession()
@@ -789,6 +737,89 @@ class SpotifyAPI:
             return None
         finally:
             self.rate_limiter.release()
+
+    async def _get_discovered_hash(self) -> Optional[str]:
+        """Get the discovered-on hash by monitoring actual Spotify web requests"""
+        logger.info("Getting discovered-on hash from live request")
+
+        try:
+            if not self.proxy:
+                self.proxy = await self._get_proxy()
+            if not self.proxy:
+                logger.error("Failed to get proxy")
+                return None
+
+            async with self._browser_session() as browser:
+                context = await browser.new_context()
+                page = await context.new_page()
+
+                discovered_hash = None
+                hash_event = asyncio.Event()
+
+                async def handle_request(route):
+                    nonlocal discovered_hash
+                    request = route.request
+                    if 'queryArtistDiscoveredOn' in request.url:
+                        logger.info(f"Found queryArtistDiscoveredOn request: {request.url}")
+                        try:
+                            parts = request.url.split('=')
+                            for part in parts:
+                                try:
+                                    data = json.loads(urllib.parse.unquote(part))
+                                    if data.get('persistedQuery', {}).get('sha256Hash'):
+                                        discovered_hash = data['persistedQuery']['sha256Hash']
+                                        logger.info(f"Found hash: {discovered_hash}")
+                                        hash_event.set()
+                                except json.JSONDecodeError:
+                                    continue
+                        except Exception as e:
+                            logger.error(f"Error parsing URL: {e}")
+                    await route.continue_()
+
+                # Listen to network requests
+                await page.route("**/*", handle_request)
+
+                # Visit a known artist page
+                artist_id = "3GBPw9NK25X1Wt2OUvOwY3"
+                await page.goto(f'https://open.spotify.com/artist/{artist_id}/discovered-on', timeout=60000)
+
+                # Wait for hash with timeout
+                try:
+                    await asyncio.wait_for(hash_event.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    logger.error("Timeout waiting for discovered hash")
+                    return None
+
+                result = None
+                if discovered_hash:
+                    # Save the hash in Redis for future use
+                    await self.cache.save_discovered_hash(discovered_hash)
+                    result = discovered_hash
+                else:
+                    logger.error("Failed to capture discovered-on hash")
+
+                # Cleanup routes before closing
+                try:
+                    await page.unroute_all(behavior='ignoreErrors')
+                    await page.close()
+                except Exception as e:
+                    logger.error(f"Error during page cleanup: {e}")
+
+                return result
+
+        except Exception as e:
+            logger.error(f"Error getting discovered-on hash: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return None
+
+    async def _ensure_discovered_hash(self) -> Optional[str]:
+        """Ensures we have a valid discovered-on hash, waiting for background refresh if needed"""
+        for retry in range(3):
+            if discovered_hash := await self.cache.get_discovered_hash():
+                return discovered_hash
+            await asyncio.sleep(2)
+        return None
 
     @staticmethod
     def _format_discovered_on(data: Dict) -> Optional[Dict]:
@@ -899,113 +930,6 @@ class SpotifyAPI:
             if cached_data.get(aid)
         }
 
-    async def _get_discovered_hash(self) -> Optional[str]:
-        """Get the discovered-on hash with proper locking and caching"""
-        logger.info("Getting discovered-on hash")
-
-        # Try to get from cache first
-        if cached_hash := await self.cache.get_discovered_hash():
-            logger.info("Using cached discovered-on hash")
-            return cached_hash
-
-        # If not in cache, try to acquire lock
-        if not await self.cache.acquire_lock('discovered', timeout=60):  # Increased timeout
-            logger.info("Waiting for discovered hash to be generated")
-            for _ in range(60):  # Increased wait time
-                if cached_hash := await self.cache.get_discovered_hash():
-                    logger.info("Got cached hash while waiting")
-                    return cached_hash
-                await asyncio.sleep(1)
-            logger.error("Timeout waiting for discovered hash")
-            return None
-
-        try:
-            logger.info("Starting hash capture process")
-            if not self.proxy:
-                self.proxy = await self._get_proxy()
-            if not self.proxy:
-                logger.error("Failed to get proxy")
-                return None
-
-            async with self._browser_session() as browser:
-                context = await browser.new_context()
-                page = await context.new_page()
-                discovered_hash = None
-
-                async def handle_request(request):
-                    nonlocal discovered_hash
-                    try:
-                        url = request.url
-                        if 'queryArtistDiscoveredOn' in url:
-                            logger.info(f"Found queryArtistDiscoveredOn request: {url[:100]}...")
-                            parts = urllib.parse.urlparse(url).query.split('&')
-                            for part in parts:
-                                if 'extensions=' in part:
-                                    decoded = urllib.parse.unquote(part.split('=')[1])
-                                    data = json.loads(decoded)
-                                    if hash_value := data.get('persistedQuery', {}).get('sha256Hash'):
-                                        discovered_hash = hash_value
-                                        logger.info(f"Successfully extracted hash: {hash_value}")
-                                        return
-                    except Exception as e:
-                        logger.error(f"Error in request handler: {e}")
-                    await request.continue_()
-
-                # Set up request interception
-                await page.route("**/*", handle_request)
-
-                try:
-                    logger.info("Navigating to artist page")
-                    await page.goto(
-                        'https://open.spotify.com/artist/3GBPw9NK25X1Wt2OUvOwY3/discovered-on',
-                        timeout=60000,
-                        wait_until='networkidle'
-                    )
-
-                    # Additional wait and scroll to trigger requests
-                    await page.wait_for_timeout(5000)
-                    await page.evaluate("window.scrollBy(0, 500)")
-                    await page.wait_for_timeout(5000)
-
-                    if not discovered_hash:
-                        # Try getting it from network requests directly
-                        requests = await page.context.all_requests()
-                        for request in requests:
-                            if 'queryArtistDiscoveredOn' in request.url:
-                                url = request.url
-                                logger.info(f"Found request in history: {url[:100]}...")
-                                try:
-                                    parts = urllib.parse.urlparse(url).query.split('&')
-                                    for part in parts:
-                                        if 'extensions=' in part:
-                                            decoded = urllib.parse.unquote(part.split('=')[1])
-                                            data = json.loads(decoded)
-                                            if hash_value := data.get('persistedQuery', {}).get('sha256Hash'):
-                                                discovered_hash = hash_value
-                                                logger.info(f"Got hash from request history: {hash_value}")
-                                                break
-                                except Exception as e:
-                                    logger.error(f"Error parsing request history: {e}")
-
-                except Exception as e:
-                    logger.error(f"Navigation error: {e}")
-                    return None
-
-                if discovered_hash:
-                    logger.info("Saving discovered hash to cache")
-                    await self.cache.save_discovered_hash(discovered_hash)
-                    return discovered_hash
-
-                logger.error("Failed to capture discovered-on hash")
-                return None
-
-        except Exception as e:
-            logger.error(f"Error getting discovered-on hash: {e}")
-            import traceback
-            logger.error(f"Full traceback: {traceback.format_exc()}")
-            return None
-        finally:
-            await self.cache.release_lock('discovered')
 
     async def _get_track_token(self) -> bool:
         """Get a new track token using browser automation."""
@@ -1257,7 +1181,7 @@ class SpotifyAPI:
                     data = json.loads(response_text)
 
                     if 'errors' in data:
-                        logger.error(f"GraphQL errors in track response: {data['errors']}")
+                        #logger.error(f"GraphQL errors in track response: {data['errors']}")
                         return None
 
                     if data.get('data', {}).get('trackUnion') is None:

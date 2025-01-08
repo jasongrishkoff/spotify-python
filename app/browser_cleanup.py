@@ -15,15 +15,19 @@ async def cleanup_browsers():
                     args=['--no-sandbox']
                 )
                 if browser:
-                    # Create a new context and close any pages
-                    context = await browser.new_context()
-                    # Access pages as a property, not a method
-                    pages = context.pages
-                    if pages:
-                        for page in pages:
-                            await page.close()
-                    await context.close()
+                    # Get all contexts
+                    contexts = browser.contexts
+                    for context in contexts:
+                        # Get pages for the context
+                        pages = await context.pages
+                        if pages:
+                            # Close each page
+                            await asyncio.gather(*(page.close() for page in pages))
+                        # Close the context
+                        await context.close()
+                    # Finally close the browser
                     await browser.close()
+                    logger.info("Browser cleanup completed successfully")
             except Exception as e:
                 logger.error(f"Error in graceful browser cleanup: {e}")
 

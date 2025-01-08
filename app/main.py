@@ -29,16 +29,38 @@ app.add_middleware(
 )
 
 async def refresh_token_task():
-    """Token refresh task with proper error handling"""
+    """Token refresh task with proper error handling for all token types and hashes"""
     try:
-        # Only refresh if we can acquire the lock
-        if await redis_cache.acquire_lock():
+        # Refresh playlist token
+        if await redis_cache.acquire_lock('playlist'):
             try:
-                await spotify_api.refresh_token()
+                await spotify_api.refresh_token('playlist')
             finally:
-                await redis_cache.release_lock()
-        else:
-            logger.info("Token refresh already in progress by another worker")
+                await redis_cache.release_lock('playlist')
+        
+        # Refresh artist token
+        if await redis_cache.acquire_lock('artist'):
+            try:
+                await spotify_api.refresh_token('artist')
+            finally:
+                await redis_cache.release_lock('artist')
+                
+        # Refresh track token
+        if await redis_cache.acquire_lock('track'):
+            try:
+                await spotify_api.refresh_token('track')
+            finally:
+                await redis_cache.release_lock('track')
+                
+        # Refresh discovered-on hash if needed
+        if await redis_cache.acquire_lock('discovered_hash'):
+            try:
+                discovered_hash = await spotify_api._get_discovered_hash()
+                if discovered_hash:
+                    await redis_cache.save_discovered_hash(discovered_hash)
+            finally:
+                await redis_cache.release_lock('discovered_hash')
+
     except Exception as e:
         logger.error(f"Token refresh error: {str(e)}")
         raise
@@ -46,6 +68,9 @@ async def refresh_token_task():
 @app.on_event("startup")
 @repeat_every(seconds=300)  # Run every 5 minutes
 async def scheduled_token_refresh():
+    # Add random jitter between 0-30 seconds
+    jitter = random.uniform(0, 30)
+    await asyncio.sleep(jitter)
     await refresh_token_task()
 
 @app.on_event("startup")
@@ -86,7 +111,6 @@ async def shutdown_event():
 @app.get("/api/playlist/{playlist_id}")
 async def get_playlist(
     playlist_id: str,
-    background_tasks: BackgroundTasks,
     with_tracks: bool = False
 ):
     """Get a single playlist by ID"""
@@ -107,9 +131,6 @@ async def get_playlist(
         if not playlist:
             raise HTTPException(status_code=404, detail="Playlist not found")
 
-        # Schedule token refresh for next request if needed
-        background_tasks.add_task(refresh_token_task)
-
         return playlist
 
     except Exception as e:
@@ -122,7 +143,6 @@ async def get_playlist(
 @app.post("/api/playlists")
 async def get_playlists(
     request: PlaylistRequest,
-    background_tasks: BackgroundTasks
 ):
     """Get multiple playlists by their IDs"""
     try:
@@ -142,9 +162,6 @@ async def get_playlists(
         if not valid_results:
             raise HTTPException(status_code=404, detail="No valid playlists found")
 
-        # Add token refresh to background tasks if needed
-        background_tasks.add_task(refresh_token_task)
-
         return valid_results
     except Exception as e:
         logger.error(f"Error fetching playlists: {e}")
@@ -157,7 +174,6 @@ class ArtistRequest(BaseModel):
 @app.get("/api/artist/{artist_id}")
 async def get_artist(
     artist_id: str,
-    background_tasks: BackgroundTasks,
     detail: bool = False  # New query parameter
 ):
     """
@@ -185,9 +201,6 @@ async def get_artist(
             logger.warning(f"Artist {artist_id} not found in results dictionary")
             raise HTTPException(status_code=404, detail="Artist not found")
 
-        # Schedule token refresh for next request if needed
-        background_tasks.add_task(refresh_token_task)
-
         return artist
 
     except Exception as e:
@@ -202,7 +215,6 @@ async def get_artist(
 @app.post("/api/artists")
 async def get_artists(
     request: ArtistRequest,
-    background_tasks: BackgroundTasks
 ):
     """Get multiple artists by their IDs. Optionally return detailed data."""
     try:
@@ -222,9 +234,6 @@ async def get_artists(
         if not valid_results:
             raise HTTPException(status_code=404, detail="No valid artists found")
 
-        # Add token refresh to background tasks if needed
-        background_tasks.add_task(refresh_token_task)
-
         return valid_results
 
     except Exception as e:
@@ -237,7 +246,6 @@ class DiscoveredRequest(BaseModel):
 @app.get("/api/discovered-on/{artist_id}")
 async def get_discovered_on(
     artist_id: str,
-    background_tasks: BackgroundTasks
 ):
     """Get discovered-on data for a single artist"""
     try:
@@ -250,9 +258,6 @@ async def get_discovered_on(
         if not artist_data:
             raise HTTPException(status_code=404, detail="Artist not found")
 
-        # Schedule token refresh for next request if needed
-        background_tasks.add_task(refresh_token_task)
-
         return artist_data
 
     except Exception as e:
@@ -264,7 +269,6 @@ async def get_discovered_on(
 @app.post("/api/discovered-on")
 async def get_multiple_discovered_on(
     request: DiscoveredRequest,
-    background_tasks: BackgroundTasks
 ):
     """Get discovered-on data for multiple artists"""
     try:
@@ -276,9 +280,6 @@ async def get_multiple_discovered_on(
 
         if not results:
             raise HTTPException(status_code=404, detail="No valid artists found")
-
-        # Add token refresh to background tasks if needed
-        background_tasks.add_task(refresh_token_task)
 
         return list(results.values())
 
@@ -294,7 +295,6 @@ class TrackRequest(BaseModel):
 @app.get("/api/track/{track_id}")
 async def get_track(
     track_id: str,
-    background_tasks: BackgroundTasks
 ):
     """Get a single track by ID"""
     try:
@@ -307,9 +307,6 @@ async def get_track(
         if not track:
             raise HTTPException(status_code=404, detail="Track not found")
 
-        # Schedule token refresh for next request if needed
-        background_tasks.add_task(refresh_token_task)
-
         return track
 
     except Exception as e:
@@ -321,7 +318,6 @@ async def get_track(
 @app.get("/api/track-detail/{track_id}")
 async def get_track_detail(
     track_id: str,
-    background_tasks: BackgroundTasks
 ):
     """Get detailed track information by ID"""
     try:
@@ -334,9 +330,6 @@ async def get_track_detail(
         if not track:
             raise HTTPException(status_code=404, detail="Track not found")
 
-        # Schedule token refresh for next request if needed
-        background_tasks.add_task(refresh_token_task)
-
         return track
 
     except Exception as e:
@@ -348,7 +341,6 @@ async def get_track_detail(
 @app.post("/api/tracks")
 async def get_tracks(
     request: TrackRequest,
-    background_tasks: BackgroundTasks
 ):
     """Get multiple tracks by their IDs"""
     try:
@@ -367,9 +359,6 @@ async def get_tracks(
 
         if not valid_results:
             raise HTTPException(status_code=404, detail="No valid tracks found")
-
-        # Add token refresh to background tasks if needed
-        background_tasks.add_task(refresh_token_task)
 
         return valid_results
         

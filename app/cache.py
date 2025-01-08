@@ -8,7 +8,16 @@ logger = logging.getLogger(__name__)
 
 class RedisCache:
     def __init__(self, host='localhost', port=6379, db=0):
-        self.redis = redis.Redis(host=host, port=port, db=db, decode_responses=True)
+        self.redis = redis.Redis(
+            host=host,
+            port=port,
+            db=db,
+            decode_responses=True,
+            max_connections=50,  # Add connection pooling
+            socket_timeout=5,
+            socket_connect_timeout=5,
+            retry_on_timeout=True
+        )
         # Separate lock keys for different token types and discovered hash
         self._lock_keys = {
             'playlist': 'spotify_playlist_token_lock',
