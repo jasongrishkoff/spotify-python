@@ -54,7 +54,7 @@ class RateLimiter:
     rate: int  # requests per second
     max_concurrent: int
     
-    def __init__(self, rate: int = 100, max_concurrent: int = 20):
+    def __init__(self, rate: int = 250, max_concurrent: int = 50):
         self.rate = rate
         self.max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
