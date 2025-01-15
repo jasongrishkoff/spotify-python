@@ -354,7 +354,7 @@ class SpotifyAPI:
                 
             url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
             if with_tracks:
-                url += "?fields=collaborative,id,name,owner,description,followers,images,tracks.total,tracks.items(added_at,track(id,artists))"
+                url += "?fields=collaborative,id,name,owner,description,followers,images,tracks.total,tracks.items(added_at,track(id,artists,name,album(images)))"
                 
             async with self.session.get(
                 url,
@@ -429,6 +429,8 @@ class SpotifyAPI:
                 'added_at': item.get('added_at'),
                 'track': {
                     'id': track.get('id'),
+                    'name': track.get('name'),
+                    'album': track.get('album'),
                     'artists': artists
                 }
             })
