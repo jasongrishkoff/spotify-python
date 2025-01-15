@@ -111,12 +111,13 @@ async def shutdown_event():
 @app.get("/api/playlist/{playlist_id}")
 async def get_playlist(
     playlist_id: str,
-    with_tracks: bool = False
+    with_tracks: bool = False,
+    raw_data: bool = False,
 ):
     """Get a single playlist by ID"""
     try:
         # First try to get the playlist
-        results = await spotify_api.get_playlists([playlist_id], with_tracks=with_tracks, skip_cache=True)
+        results = await spotify_api.get_playlists([playlist_id], with_tracks=with_tracks, skip_cache=True, raw_data=raw_data)
 
         if not results:
             raise HTTPException(status_code=404, detail="Playlist not found")

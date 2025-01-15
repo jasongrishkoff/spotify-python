@@ -250,6 +250,7 @@ class SpotifyAPI:
             playlist_ids: List[str],
             with_tracks: bool = False,
             skip_cache: bool = False,
+            raw_data: bool = False,
     ) -> Dict[str, Optional[Dict]]:
         await self._ensure_initialized()
         # Get unique playlist IDs while preserving order
@@ -269,10 +270,11 @@ class SpotifyAPI:
             # Still save to cache for future requests
             if valid_playlists:
                 await self.db.save_playlists(valid_playlists)
-            return {
-                p['id']: self._format_playlist(p, with_tracks)
-                for p in valid_playlists
-            }
+
+            if raw_data:
+                return {p['id']: p for p in valid_playlists}
+            else:
+                return {p['id']: self._format_playlist(p, with_tracks) for p in valid_playlists}
 
         # Get all cached playlists
         cached_playlists = await self.db.get_playlists(unique_ids)
@@ -303,13 +305,20 @@ class SpotifyAPI:
                 await self.db.save_playlists(valid_playlists)
                 # Update our working set with new data
                 cached_playlists.update({p['id']: p for p in valid_playlists})
-        # Format and return results, filtering out invalid cached entries
-        return {
-            pid: self._format_playlist(data, with_tracks) if data and isinstance(data, dict) else None
-            for pid, data in cached_playlists.items()
-            if not (with_tracks and data and not self._has_track_data(data))
-        }
 
+        # Format and return results, filtering out invalid cached entries
+        if raw_data:
+            return {
+                pid: data
+                for pid, data in cached_playlists.items()
+                if data and isinstance(data, dict) and not (with_tracks and not self._has_track_data(data))
+            }
+        else:
+            return {
+                pid: self._format_playlist(data, with_tracks) if data and isinstance(data, dict) else None
+                for pid, data in cached_playlists.items()
+                if not (with_tracks and data and not self._has_track_data(data))
+            }
 
     @staticmethod
     def _has_track_data(playlist: Optional[Dict]) -> bool:
@@ -354,7 +363,7 @@ class SpotifyAPI:
                 
             url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
             if with_tracks:
-                url += "?fields=collaborative,id,name,owner,description,followers,images,tracks.total,tracks.items(added_at,track(id,artists,name,album(images)))"
+                url += "?fields=collaborative,id,name,owner,description,followers,images,tracks.total,tracks.items(added_at,track(id,artists,name,preview_url,duration_ms,album(images)))"
                 
             async with self.session.get(
                 url,
@@ -431,6 +440,8 @@ class SpotifyAPI:
                     'id': track.get('id'),
                     'name': track.get('name'),
                     'album': track.get('album'),
+                    'duration_ms': track.get('duration_ms'),
+                    'preview_url': track.get('preview_url'),
                     'artists': artists
                 }
             })
