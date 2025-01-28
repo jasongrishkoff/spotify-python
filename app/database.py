@@ -1,7 +1,7 @@
 import aiosqlite
 import time
 import json
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from contextlib import asynccontextmanager
 import asyncio
 import logging
@@ -138,12 +138,15 @@ class AsyncDatabase:
                     for row in results
                 }
 
-    async def save_artists(self, artists: List[Dict]):
+    async def save_artists(self, artists: List[Tuple[str, Dict]]):
+        """
+        Save artists to cache. Each artist is a tuple of (cache_key, data)
+        """
         async with self.connection() as db:
             current_time = int(time.time())
             await db.executemany(
                 'INSERT OR REPLACE INTO artists (id, data, created_at) VALUES (?, ?, ?)',
-                [(a['id'], json.dumps(a), current_time) for a in artists]
+                [(key, json.dumps(data), current_time) for key, data in artists]
             )
             await db.commit()
 
