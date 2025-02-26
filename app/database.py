@@ -178,10 +178,39 @@ class AsyncDatabase:
             )
             await db.commit()
 
+    @asynccontextmanager
+    async def connection(self):
+        """Get a database connection with improved concurrency handling"""
+        await self._init_db()  # Ensure tables exist
+        max_retries = 5
+        
+        for attempt in range(max_retries):
+            try:
+                # Increasing timeout and adding retry logic
+                async with aiosqlite.connect(self.path, timeout=30.0) as db:
+                    db.row_factory = aiosqlite.Row
+                    # Use WAL mode for better concurrency
+                    await db.execute('PRAGMA journal_mode = WAL')
+                    # Give time for busy database to become available
+                    await db.execute('PRAGMA busy_timeout = 30000')
+                    # Limit to one writer at a time, but allow multiple readers
+                    await db.execute('PRAGMA locking_mode = NORMAL')
+                    yield db
+                    break  # Successful connection, exit retry loop
+            except aiosqlite.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    # Exponential backoff with jitter
+                    wait_time = 0.1 * (2 ** attempt) * (0.5 + random.random())
+                    logger.warning(f"Database locked, retrying in {wait_time:.2f}s (attempt {attempt+1}/{max_retries})")
+                    await asyncio.sleep(wait_time)
+                else:
+                    # Last attempt or different error - propagate it
+                    raise
+
+    # 2. Improve cleanup_old_records method to be less aggressive
     async def cleanup_old_records(self):
         """
-        Efficiently clean up old records using optimized queries and batched deletions.
-        Uses a lock to prevent concurrent cleanup operations.
+        More gentle cleanup that reduces lock contention
         """
         # Prevent multiple cleanup operations from running simultaneously
         if not await self._cleanup_lock.acquire():
@@ -189,92 +218,75 @@ class AsyncDatabase:
             return
             
         try:
-            async with aiosqlite.connect(self.path, timeout=60.0) as db:  # Increased timeout
-                await db.execute('PRAGMA journal_mode = WAL')  # Use Write-Ahead Logging
-                await db.execute('PRAGMA busy_timeout = 60000')  # 60 second timeout
+            async with aiosqlite.connect(self.path, timeout=60.0) as db:
+                await db.execute('PRAGMA journal_mode = WAL')
+                await db.execute('PRAGMA busy_timeout = 60000')
                 current_time = int(time.time())
 
-                try:
-                    # Define cleanup thresholds
-                    thresholds = {
-                        'auth': current_time - 3600,        # 1 hour for auth tokens
-                        'playlists': current_time - 3600,   # 1 hour for playlists
-                        'artists': current_time - 3600,     # 1 hour for artists
-                        'discovered_on': current_time - 3600, # 1 hour for discovered_on
-                        'tracks': current_time - 3600       # 1 hour for tracks
-                    }
+                # Define cleanup thresholds
+                thresholds = {
+                    'auth': current_time - 3600,        # 1 hour for auth tokens
+                    'playlists': current_time - 3600,   # 1 hour for playlists
+                    'artists': current_time - 3600,     # 1 hour for artists
+                    'discovered_on': current_time - 3600, # 1 hour for discovered_on
+                    'tracks': current_time - 3600       # 1 hour for tracks
+                }
 
-                    # Get counts before cleanup
-                    counts_before = {}
-                    for table in thresholds.keys():
-                        async with db.execute(f'SELECT COUNT(*) FROM {table}') as cursor:
-                            counts_before[table] = (await cursor.fetchone())[0]
-
-                    # Process each table
-                    for table, threshold in thresholds.items():
-                        try:
-                            # Use a single transaction per table
-                            await db.execute('BEGIN TRANSACTION')
+                for table, threshold in thresholds.items():
+                    # Process each table with much smaller batches and pauses between
+                    delete_count = 0
+                    
+                    try:
+                        # Use separate transactions for counting and deleting
+                        async with db.execute(f'SELECT COUNT(*) FROM {table} WHERE created_at < ?', 
+                                             (threshold,)) as cursor:
+                            total_to_delete = (await cursor.fetchone())[0]
+                        
+                        if total_to_delete == 0:
+                            logger.debug(f"No records to clean in {table}")
+                            continue
                             
-                            # Delete in smaller batches (500 instead of 1000)
-                            while True:
+                        #logger.info(f"Cleaning up to {total_to_delete} records from {table}")
+                        
+                        # Delete in very small batches with longer pauses
+                        # to minimize impact on concurrent operations
+                        batch_size = 20
+                        while delete_count < total_to_delete:
+                            try:
+                                await db.execute('BEGIN TRANSACTION')
                                 async with db.execute(
-                                    f'DELETE FROM {table} WHERE created_at < ? LIMIT 500',
+                                    f'DELETE FROM {table} WHERE created_at < ? LIMIT {batch_size}',
                                     (threshold,)
                                 ) as cursor:
-                                    if cursor.rowcount == 0:
+                                    deleted = cursor.rowcount
+                                    if deleted == 0:
+                                        await db.commit()
                                         break
-                                    logger.info(f'Deleted {cursor.rowcount} records from {table}')
-                                await db.commit()  # Commit each batch
+                                        
+                                    delete_count += deleted
+                                await db.commit()
                                 
-                                # Small delay between batches to reduce contention
-                                await asyncio.sleep(0.1)
+                                # Much longer pause between batches to reduce contention
+                                await asyncio.sleep(1.0)
                                 
-                                # Start new transaction for next batch
-                                await db.execute('BEGIN TRANSACTION')
-                                
-                            await db.commit()
+                            except Exception as e:
+                                logger.error(f'Error in {table} cleanup batch: {e}')
+                                await db.execute('ROLLBACK')
+                                # Short pause after error
+                                await asyncio.sleep(1)
+                        
+                        logger.info(f'Cleaned {delete_count} records from {table}')
                             
-                        except Exception as e:
-                            logger.error(f'Error cleaning up {table}: {e}')
-                            await db.execute('ROLLBACK')
-                            continue
-
-                    # Get final counts
-                    counts_after = {}
-                    for table in thresholds.keys():
-                        try:
-                            async with db.execute(f'SELECT COUNT(*) FROM {table}') as cursor:
-                                counts_after[table] = (await cursor.fetchone())[0]
-                        except Exception as e:
-                            logger.error(f'Error getting final count for {table}: {e}')
-                            continue
-
-                    # Log results
-                    for table in thresholds.keys():
-                        if table in counts_before and table in counts_after:
-                            removed = counts_before[table] - counts_after[table]
-                            if removed > 0:
-                                logger.info(f'Cleaned up {removed} records from {table}. '
-                                          f'Remaining: {counts_after[table]}')
-
-                    # Optimize database after cleanup
-                    try:
-                        await db.execute('PRAGMA optimize')
-                        await db.execute('PRAGMA wal_checkpoint(FULL)')
                     except Exception as e:
-                        logger.error(f'Error during optimization: {e}')
+                        logger.error(f'Error cleaning up {table}: {e}')
+                        continue
 
-                except Exception as e:
-                    logger.error(f'Error during cleanup: {e}')
-                    raise
-
+                # No need for PRAGMA optimize during high load - save it for low traffic periods
+                    
         except Exception as e:
             logger.error(f'Database cleanup failed: {e}')
-            import traceback
-            logger.error(f'Cleanup traceback: {traceback.format_exc()}')
         finally:
-            self._cleanup_lock.release()  # Always release the lock
+            self._cleanup_lock.release()
 
     async def get_tracks(self, track_ids: List[str]) -> Dict[str, Dict]:
         async with self.connection() as db:

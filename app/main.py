@@ -5,7 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi_utils.tasks import repeat_every
 from pydantic import BaseModel
 from typing import List, Dict, Optional
-from .spotify import SpotifyAPI
+from .spotify import SpotifyAPI, ProxyConfig
+from .token_management import TokenManager, SpotifyAPIEnhanced, setup_token_management
 from .database import AsyncDatabase
 from .cache import RedisCache
 import asyncio
@@ -15,99 +16,95 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 class PlaylistRequest(BaseModel):
-	ids: List[str]
-	with_tracks: Optional[bool] = False
+    ids: List[str]
+    with_tracks: Optional[bool] = False
 
 app = FastAPI()
-spotify_api = SpotifyAPI()
+
+# Use the enhanced SpotifyAPI class
+spotify_api = SpotifyAPIEnhanced()
 redis_cache = RedisCache()
 
 app.add_middleware(
-		CORSMiddleware,
-		allow_origins=["*"],
-		allow_methods=["*"],
-		allow_headers=["*"],
-		)
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-async def refresh_token_task():
-	"""Token refresh task with proper error handling for all token types and hashes"""
-	try:
-		# Refresh playlist token
-		if await redis_cache.acquire_lock('playlist'):
-			try:
-				await spotify_api.refresh_token('playlist')
-			finally:
-				await redis_cache.release_lock('playlist')
-
-		# Refresh artist token
-		if await redis_cache.acquire_lock('artist'):
-			try:
-				await spotify_api.refresh_token('artist')
-			finally:
-				await redis_cache.release_lock('artist')
-
-		# Refresh track token
-		if await redis_cache.acquire_lock('track'):
-			try:
-				await spotify_api.refresh_token('track')
-			finally:
-				await redis_cache.release_lock('track')
-
-		# Refresh discovered-on hash if needed
-		if await redis_cache.acquire_lock('discovered_hash'):
-			try:
-				discovered_hash = await spotify_api._get_discovered_hash()
-				if discovered_hash:
-					await redis_cache.save_discovered_hash(discovered_hash)
-			finally:
-				await redis_cache.release_lock('discovered_hash')
-
-	except Exception as e:
-		logger.error(f"Token refresh error: {str(e)}")
-		raise
+# We'll set up the token manager during startup
+@app.on_event("startup")
+async def startup_event():
+    # Initialize the token manager
+    await setup_token_management(app, spotify_api, redis_cache)
+    logger.info("Token management system initialized")
 
 @app.on_event("startup")
-@repeat_every(seconds=300)  # Run every 5 minutes
-async def scheduled_token_refresh():
-	# Add random jitter between 0-30 seconds
-	jitter = random.uniform(0, 30)
-	await asyncio.sleep(jitter)
-	await refresh_token_task()
+@repeat_every(seconds=604800)  # Run once per week
+async def scheduled_db_maintenance():
+    """Run database optimization with minimal impact"""
+    try:
+        # Add a large jitter to spread instances across the week
+        jitter = random.uniform(0, 86400)  # Up to 24 hours jitter
+        await asyncio.sleep(jitter)
+        
+        logger.info("Starting database optimization")
+        
+        async with aiosqlite.connect(AsyncDatabase().path) as db:
+            start_time = time.time()
+            
+            # Run VACUUM to reclaim space
+            await db.execute("VACUUM")
+            
+            # Run OPTIMIZE to defragment the database
+            await db.execute("PRAGMA optimize")
+            
+            # Reset the WAL file
+            await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            
+            duration = time.time() - start_time
+            logger.info(f"Database optimization completed in {duration:.2f}s")
+            
+    except Exception as e:
+        logger.error(f"Error during database optimization: {e}")
 
+# Keep the database cleanup task
 @app.on_event("startup")
 @repeat_every(seconds=3600)  # Run every hour
 async def scheduled_cleanup():
-	"""Run database cleanup every hour with error handling and logging"""
-	try:
-		logger.info(f"Starting scheduled cleanup at {datetime.now()}")
-		db = AsyncDatabase()
+    """Run database cleanup every hour with error handling and logging"""
+    try:
+        logger.info(f"Starting scheduled cleanup at {datetime.now()}")
+        db = AsyncDatabase()
 
-		# Add jitter to prevent all instances cleaning up simultaneously
-		jitter = random.uniform(0, 60)  # Random delay between 0-60 seconds
-		await asyncio.sleep(jitter)
+        # Add jitter to prevent all instances cleaning up simultaneously
+        jitter = random.uniform(0, 60)  # Random delay between 0-60 seconds
+        await asyncio.sleep(jitter)
 
-		start_time = datetime.now()
-		await db.cleanup_old_records()
-		duration = (datetime.now() - start_time).total_seconds()
+        start_time = datetime.now()
+        await db.cleanup_old_records()
+        duration = (datetime.now() - start_time).total_seconds()
 
-		logger.info(f"Completed cleanup in {duration:.2f} seconds")
+        logger.info(f"Completed cleanup in {duration:.2f} seconds")
 
-	except Exception as e:
-		logger.error(f"Error in scheduled cleanup: {e}")
-		# Don't raise the error - we want the scheduler to continue running
+    except Exception as e:
+        logger.error(f"Error in scheduled cleanup: {e}")
+        # Don't raise the error - we want the scheduler to continue running
 
+# Keep the browser cleanup task
 @app.on_event("startup")
 @repeat_every(seconds=300)  # Run every 5 minutes
 async def scheduled_browser_cleanup():
-	"""Periodic task to clean up any orphaned browser processes"""
-	from .browser_cleanup import cleanup_browsers  # Import the new cleanup function
-	await cleanup_browsers()
+    """Periodic task to clean up any orphaned browser processes"""
+    from .browser_cleanup import cleanup_browsers
+    await cleanup_browsers()
 
 @app.on_event("shutdown")
 async def shutdown_event():
-	logger.info("Shutting down application...")
-	await cleanup_browsers()
-	await spotify_api.close()
+    logger.info("Shutting down application...")
+    from .browser_cleanup import cleanup_browsers
+    await cleanup_browsers()
+    await spotify_api.close()
 
 @app.get("/api/playlist/{playlist_id}")
 async def get_playlist(
@@ -231,7 +228,7 @@ async def get_artists(request: ArtistRequest):
             raise HTTPException(status_code=400, detail="No artist IDs provided")
 
         # Debug the parsed request
-        logger.info("Parsed request model: %s", request.dict())
+        #logger.info("Parsed request model: %s", request.dict())
 
         artist_ids = request.ids[:200]
 

@@ -156,63 +156,102 @@ class SpotifyAPI:
                 logger.error(f"Error during browser cleanup: {str(e)}")
 
     async def _ensure_auth(self, token_type: str = 'playlist') -> bool:
+        """
+        Check if we have a valid token, and if not, try to refresh it.
+        This is a modified version that's more efficient and resilient.
+        """
         # Quick check if we already have a valid token
+        if self.access_token and self.proxy:
+            return True
+
+        # Check cache first
         if cached := await self.cache.get_token(token_type):
             cached_time = cached['proxy'].get('created_at', 0)
             current_time = int(time.time())
 
             if current_time - cached_time < 480:  # 8 minutes
                 self.access_token = cached['access_token']
-                self.proxy = ProxyConfig(**cached['proxy'])
+
+                # Handle proxy data format (might be string or dict)
+                proxy_data = cached['proxy']
+                if isinstance(proxy_data, str):
+                    import json
+                    proxy_data = json.loads(proxy_data)
+
+                self.proxy = ProxyConfig(**proxy_data)
                 return True
 
         # Use exponential backoff for waiting
-        max_attempts = 5
+        max_attempts = 3  # Reduced from 5 to minimize blocking
         for attempt in range(max_attempts):
-            if await self.cache.acquire_lock(token_type, timeout=30):
+            # Try to acquire lock with shorter timeout
+            if await self.cache.acquire_lock(token_type, timeout=10):
                 try:
-                    success = await self._get_token(token_type)
+                    # Double-check if another process refreshed the token while we were waiting
+                    if cached := await self.cache.get_token(token_type):
+                        self.access_token = cached['access_token']
+                        proxy_data = cached['proxy']
+                        if isinstance(proxy_data, str):
+                            import json
+                            proxy_data = json.loads(proxy_data)
+                        self.proxy = ProxyConfig(**proxy_data)
+                        return True
+
+                    # Get a new token
+                    if token_type == 'track':
+                        success = await self._get_track_token()
+                    else:
+                        success = await self._get_token(token_type)
+
                     if success:
                         return True
-                    logger.error("Token refresh failed")
+
+                    logger.error(f"Token refresh failed for {token_type}")
                 finally:
                     await self.cache.release_lock(token_type)
 
-            # Exponential backoff wait
-            wait_time = min(2 ** attempt, 8)  # Max 8 second wait
+            # Exponential backoff wait with reduced times
+            wait_time = min(2 ** attempt, 4)  # Max 4 second wait (reduced from 8)
             await asyncio.sleep(wait_time)
 
-            # Check if another process refreshed the token
+            # Check if another process refreshed the token while we were waiting
             if cached := await self.cache.get_token(token_type):
                 self.access_token = cached['access_token']
-                self.proxy = ProxyConfig(**cached['proxy'])
+                proxy_data = cached['proxy']
+                if isinstance(proxy_data, str):
+                    import json
+                    proxy_data = json.loads(proxy_data)
+                self.proxy = ProxyConfig(**proxy_data)
                 return True
 
+        # If we get here, we couldn't get a token
         return False
 
     async def _get_token(self, token_type: str = 'playlist') -> bool:
         """
         Get a new token using browser automation.
-        Returns True if successful, False otherwise.
+        Enhanced version with better error handling and logging.
         """
         for retry in range(self.MAX_RETRIES):
             try:
                 if not self.proxy:
                     self.proxy = await self._get_proxy()
                 if not self.proxy:
-                    logger.error("Failed to get proxy")
+                    logger.error(f"Failed to get proxy on attempt {retry + 1}")
+                    await asyncio.sleep(1)
                     continue
 
                 async with self._browser_session(retry) as browser:
-                    logger.info(f"Browser launched (attempt {retry + 1})")
+                    logger.info(f"Browser launched for {token_type} token (attempt {retry + 1})")
                     context = await browser.new_context()
                     page = await context.new_page()
 
                     # Set a strict timeout for the entire operation
                     try:
+                        logger.debug(f"Opening Spotify page for {token_type} token")
                         async with asyncio.timeout(45):  # 45 second total timeout
-                            await page.goto('https://open.spotify.com', timeout=30000)
-                            await page.wait_for_load_state('networkidle', timeout=30000)
+                            await page.goto('https://open.spotify.com', timeout=15000)  # Reduced from 30000
+                            await page.wait_for_load_state('networkidle', timeout=15000)  # Reduced from 30000
 
                             token_info = await page.evaluate('''() => {
                                 const script = document.getElementById('session');
@@ -220,10 +259,11 @@ class SpotifyAPI:
                             }''')
 
                             if not token_info or not token_info.get('accessToken'):
-                                logger.error("No token found in page")
+                                logger.error(f"No token found in page for {token_type}")
                                 continue
 
                             self.access_token = token_info['accessToken']
+                            logger.info(f"Successfully got {token_type} token")
 
                             # Save to Redis with current timestamp
                             await self.cache.save_token(
@@ -234,15 +274,15 @@ class SpotifyAPI:
                             return True
 
                     except asyncio.TimeoutError:
-                        logger.error("Timeout during token acquisition")
+                        logger.error(f"Timeout during {token_type} token acquisition")
                         continue
 
             except Exception as e:
-                logger.error(f"Error in token acquisition: {str(e)}")
+                logger.error(f"Error in {token_type} token acquisition: {str(e)}")
                 self.proxy = None
                 await asyncio.sleep(1)
 
-        logger.error("All token refresh attempts failed")
+        logger.error(f"All {token_type} token refresh attempts failed")
         return False
 
     async def get_playlists(
@@ -465,7 +505,7 @@ class SpotifyAPI:
 
             artists = [
                     {
-                            'id': artist.get('id'),
+                        'id': artist.get('id'),
                         'name': artist.get('name')
                         }
                     for artist in track.get('artists', [])
