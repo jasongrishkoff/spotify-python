@@ -734,7 +734,7 @@ class SpotifyAPI:
                 logger.error("No playlist data in GraphQL response")
                 return None
                 
-            # Basic transformation - adapt based on actual response structure
+            # Basic transformation with playlist fields
             transformed = {
                 'id': playlist_id,
                 'name': playlist_data.get('name', ''),
@@ -771,27 +771,42 @@ class SpotifyAPI:
                     try:
                         track_data = item.get('itemV2', {}).get('data', {})
                         if track_data and track_data.get('__typename') == 'Track':
+                            # Extract ID from URI (spotify:track:TRACK_ID)
+                            track_id = ''
+                            if track_data.get('uri'):
+                                parts = track_data['uri'].split(':')
+                                if len(parts) == 3 and parts[1] == 'track':
+                                    track_id = parts[2]
+                            
                             track_item = {
-                                'added_at': item.get('addedAt', ''),
+                                # Get the actual ISO timestamp from addedAt.isoString
+                                'added_at': item.get('addedAt', {}).get('isoString', ''),
                                 'track': {
-                                    'id': track_data.get('id', ''),
+                                    'id': track_id,
+                                    # Get actual track name
                                     'name': track_data.get('name', ''),
-                                    'duration_ms': track_data.get('duration', {}).get('totalMilliseconds', 0),
+                                    'duration_ms': track_data.get('trackDuration', {}).get('totalMilliseconds', 0),
                                     'preview_url': track_data.get('previewUrl', ''),
                                     'artists': [],
                                     'album': {'images': []}
                                 }
                             }
                             
-                            # Add artists
+                            # Add artists properly
                             if track_data.get('artists', {}).get('items'):
                                 for artist in track_data['artists']['items']:
+                                    artist_id = ''
+                                    if artist.get('uri'):
+                                        parts = artist['uri'].split(':')
+                                        if len(parts) == 3 and parts[1] == 'artist':
+                                            artist_id = parts[2]
+                                    
                                     track_item['track']['artists'].append({
-                                        'id': artist.get('uri', '').split(':')[-1] if artist.get('uri') else '',
+                                        'id': artist_id,
                                         'name': artist.get('profile', {}).get('name', '')
                                     })
                             
-                            # Add album images
+                            # Add album images properly
                             if track_data.get('albumOfTrack', {}).get('coverArt', {}).get('sources'):
                                 for source in track_data['albumOfTrack']['coverArt']['sources']:
                                     track_item['track']['album']['images'].append({
@@ -799,10 +814,16 @@ class SpotifyAPI:
                                         'width': source.get('width', 0),
                                         'height': source.get('height', 0)
                                     })
+                                    
+                            # Add album name
+                            if track_data.get('albumOfTrack', {}).get('name'):
+                                track_item['track']['album']['name'] = track_data['albumOfTrack']['name']
                             
                             items.append(track_item)
                     except Exception as e:
                         logger.error(f"Error processing track item: {e}")
+                        import traceback
+                        logger.error(f"Traceback: {traceback.format_exc()}")
                         continue
                         
                 transformed['tracks']['items'] = items
@@ -811,8 +832,10 @@ class SpotifyAPI:
             
         except Exception as e:
             logger.error(f"Error transforming GraphQL playlist: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return None
-
+    
     async def _fetch_playlist(self, playlist_id: str, with_tracks: bool = False) -> Optional[Dict]:
         """Fetch playlist data using dynamically captured hashes"""
         try:
@@ -831,10 +854,13 @@ class SpotifyAPI:
 
             url = "https://api-partner.spotify.com/pathfinder/v1/query"
             
+            # Modified variables to ensure we get the right fields
             variables = {
                 "uri": f"spotify:playlist:{playlist_id}",
                 "offset": 0,
                 "limit": 100 if with_tracks else 1,
+                "locale": "",
+                "includePrerelease": True,
                 "enableWatchFeedEntrypoint": False
             }
             
@@ -849,7 +875,7 @@ class SpotifyAPI:
             }
             
             params = {
-                "operationName": "fetchPlaylistMetadata",
+                "operationName": "fetchPlaylist",
                 "variables": json.dumps(variables),
                 "extensions": json.dumps(extensions)
             }
@@ -1541,16 +1567,16 @@ class SpotifyAPI:
                     # Cleanup routes before closing
                     try:
                         await page.unroute_all(behavior='ignoreErrors')
-                        await page.close(timeout=5000)
+                        await page.close()  # Remove timeout parameter
                     except Exception as e:
                         logger.warning(f"Error during page cleanup: {e}")
 
                     # Cleanup context and browser with proper error handling
                     try:
-                        await context.close(timeout=5000)
+                        await context.close()  # Remove timeout parameter
                     except Exception as e:
                         logger.warning(f"Error closing context: {e}")
-                        
+ 
                     try:
                         await browser.close()
                     except Exception as e:
