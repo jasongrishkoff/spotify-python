@@ -285,6 +285,12 @@ class SpotifyAPIEnhanced(SpotifyAPI):
     def __init__(self, db_path: str = 'spotify_cache.db'):
         super().__init__(db_path)
         self.token_manager = None  # Will be set later
+        self._logger = logging.getLogger(__name__)  # Add logger instance
+
+    @property
+    def logger(self):
+        """Property to access logger"""
+        return self._logger
 
     def set_token_manager(self, token_manager):
         """Set the token manager instance"""

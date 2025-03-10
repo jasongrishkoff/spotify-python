@@ -249,8 +249,13 @@ class SpotifyAPI:
         await self.hash_manager.initialize()
 
     async def close(self):
+        """Properly close all resources"""
         if self.session:
-            await self.session.close()
+            try:
+                await self.session.close()
+                logger.info("Session closed successfully")
+            except Exception as e:
+                logger.error(f"Error closing session: {e}")
 
     async def _get_proxy(self) -> Optional[ProxyConfig]:
         if self.proxy:
@@ -296,11 +301,18 @@ class SpotifyAPI:
             raise
         finally:
             try:
+                # Only close what's still open - use try/except for each operation
                 if context:
-                    # Close context first - this will automatically close all associated pages
-                    await context.close()
+                    try:
+                        # Close context first - this will automatically close all associated pages
+                        await context.close()
+                    except Exception as e:
+                        logger.warning(f"Error closing browser context: {str(e)}")
                 if browser:
-                    await browser.close()
+                    try:
+                        await browser.close()
+                    except Exception as e:
+                        logger.warning(f"Error closing browser: {str(e)}")
                 logger.info("Browser cleanup completed")
             except Exception as e:
                 logger.error(f"Error during browser cleanup: {str(e)}")
@@ -1471,63 +1483,90 @@ class SpotifyAPI:
                 logger.error("Failed to get proxy")
                 return None
 
-            async with self._browser_session() as browser:
-                context = await browser.new_context()
-                page = await context.new_page()
+            # Use a separate variable for the browser to avoid context issues
+            discovered_hash = None
+            
+            try:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(
+                        proxy=self.proxy.to_playwright_config() if self.proxy else None,
+                        headless=True,
+                        args=[
+                            '--no-sandbox',
+                            '--disable-dev-shm-usage',
+                            '--disable-gpu',
+                        ]
+                    )
+                    
+                    # Create a new context explicitly
+                    context = await browser.new_context()
+                    page = await context.new_page()
+                    
+                    hash_event = asyncio.Event()
 
-                discovered_hash = None
-                hash_event = asyncio.Event()
+                    async def handle_request(route):
+                        nonlocal discovered_hash
+                        request = route.request
+                        if 'queryArtistDiscoveredOn' in request.url:
+                            logger.info(f"Found queryArtistDiscoveredOn request: {request.url}")
+                            try:
+                                parts = request.url.split('=')
+                                for part in parts:
+                                    try:
+                                        data = json.loads(urllib.parse.unquote(part))
+                                        if data.get('persistedQuery', {}).get('sha256Hash'):
+                                            discovered_hash = data['persistedQuery']['sha256Hash']
+                                            logger.info(f"Found hash: {discovered_hash}")
+                                            hash_event.set()
+                                    except json.JSONDecodeError:
+                                        continue
+                            except Exception as e:
+                                logger.error(f"Error parsing URL: {e}")
+                        await route.continue_()
 
-                async def handle_request(route):
-                    nonlocal discovered_hash
-                    request = route.request
-                    if 'queryArtistDiscoveredOn' in request.url:
-                        logger.info(f"Found queryArtistDiscoveredOn request: {request.url}")
-                        try:
-                            parts = request.url.split('=')
-                            for part in parts:
-                                try:
-                                    data = json.loads(urllib.parse.unquote(part))
-                                    if data.get('persistedQuery', {}).get('sha256Hash'):
-                                        discovered_hash = data['persistedQuery']['sha256Hash']
-                                        logger.info(f"Found hash: {discovered_hash}")
-                                        hash_event.set()
-                                except json.JSONDecodeError:
-                                    continue
-                        except Exception as e:
-                            logger.error(f"Error parsing URL: {e}")
-                    await route.continue_()
+                    # Listen to network requests
+                    await page.route("**/*", handle_request)
 
-                # Listen to network requests
-                await page.route("**/*", handle_request)
+                    # Visit a known artist page
+                    artist_id = "3GBPw9NK25X1Wt2OUvOwY3"
+                    await page.goto(f'https://open.spotify.com/artist/{artist_id}/discovered-on', timeout=60000)
 
-                # Visit a known artist page
-                artist_id = "3GBPw9NK25X1Wt2OUvOwY3"
-                await page.goto(f'https://open.spotify.com/artist/{artist_id}/discovered-on', timeout=60000)
+                    # Wait for hash with timeout
+                    try:
+                        await asyncio.wait_for(hash_event.wait(), timeout=30)
+                    except asyncio.TimeoutError:
+                        logger.error("Timeout waiting for discovered hash")
+                        return None
 
-                # Wait for hash with timeout
-                try:
-                    await asyncio.wait_for(hash_event.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    logger.error("Timeout waiting for discovered hash")
-                    return None
+                    # Cleanup routes before closing
+                    try:
+                        await page.unroute_all(behavior='ignoreErrors')
+                        await page.close(timeout=5000)
+                    except Exception as e:
+                        logger.warning(f"Error during page cleanup: {e}")
 
-                result = None
-                if discovered_hash:
-                    # Save the hash in Redis for future use
-                    await self.cache.save_discovered_hash(discovered_hash)
-                    result = discovered_hash
-                else:
-                    logger.error("Failed to capture discovered-on hash")
+                    # Cleanup context and browser with proper error handling
+                    try:
+                        await context.close(timeout=5000)
+                    except Exception as e:
+                        logger.warning(f"Error closing context: {e}")
+                        
+                    try:
+                        await browser.close()
+                    except Exception as e:
+                        logger.warning(f"Error closing browser: {e}")
 
-                # Cleanup routes before closing
-                try:
-                    await page.unroute_all(behavior='ignoreErrors')
-                    await page.close()
-                except Exception as e:
-                    logger.error(f"Error during page cleanup: {e}")
-
-                return result
+                    if discovered_hash:
+                        # Save the hash in Redis for future use
+                        await self.cache.save_discovered_hash(discovered_hash)
+                        return discovered_hash
+                    else:
+                        logger.error("Failed to capture discovered-on hash")
+                        return None
+                        
+            except Exception as e:
+                logger.error(f"Error in browser initialization: {e}")
+                return None
 
         except Exception as e:
             logger.error(f"Error getting discovered-on hash: {e}")
