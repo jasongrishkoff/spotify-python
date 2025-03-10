@@ -44,7 +44,8 @@ class RedisCache:
                 await asyncio.sleep(0.5)  # Add delay on error
             return None
         
-    async def save_token(self, token: str, proxy: Dict, token_type: str = 'playlist', hash_value: Optional[str] = None) -> bool:
+    async def save_token(self, token: str, proxy: Dict, token_type: str = 'playlist', 
+                        hash_value: Optional[str] = None, client_token: Optional[str] = None) -> bool:
         """Save token data to Redis with error handling."""
         async with self._semaphore:
             try:
@@ -58,6 +59,9 @@ class RedisCache:
                 
                 if hash_value:
                     data['hash_value'] = hash_value
+                    
+                if client_token:
+                    data['client_token'] = client_token
                     
                 key = f'spotify_{token_type}_token'
                 await self.redis.set(key, json.dumps(data), ex=3600)  # 1 hour expiry

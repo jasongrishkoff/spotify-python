@@ -4,7 +4,7 @@ import aiohttp
 import json
 import time
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from playwright.async_api import async_playwright
@@ -121,6 +121,7 @@ class SpotifyAPI:
         self.session: Optional[aiohttp.ClientSession] = None
         self._init_task = None
         self.access_token: Optional[str] = None
+        self.client_token: Optional[str] = None  # Add client token
         self.proxy: Optional[ProxyConfig] = None
         self.cache = RedisCache()  # Redis cache instance
         self.discovered_hash_circuit_breaker = DiscoveredHashCircuitBreaker()
@@ -207,6 +208,10 @@ class SpotifyAPI:
 
             if current_time - cached_time < 480:  # 8 minutes
                 self.access_token = cached['access_token']
+                
+                # Also get client token if available
+                if 'client_token' in cached:
+                    self.client_token = cached['client_token']
 
                 # Handle proxy data format (might be string or dict)
                 proxy_data = cached['proxy']
@@ -226,6 +231,11 @@ class SpotifyAPI:
                     # Double-check if another process refreshed the token while we were waiting
                     if cached := await self.cache.get_token(token_type):
                         self.access_token = cached['access_token']
+                        
+                        # Also get client token if available
+                        if 'client_token' in cached:
+                            self.client_token = cached['client_token']
+                            
                         proxy_data = cached['proxy']
                         if isinstance(proxy_data, str):
                             import json
@@ -234,10 +244,7 @@ class SpotifyAPI:
                         return True
 
                     # Get a new token
-                    if token_type == 'track':
-                        success = await self._get_track_token()
-                    else:
-                        success = await self._get_token(token_type)
+                    success = await self._get_token(token_type)
 
                     if success:
                         return True
@@ -253,6 +260,11 @@ class SpotifyAPI:
             # Check if another process refreshed the token while we were waiting
             if cached := await self.cache.get_token(token_type):
                 self.access_token = cached['access_token']
+                
+                # Also get client token if available
+                if 'client_token' in cached:
+                    self.client_token = cached['client_token']
+                    
                 proxy_data = cached['proxy']
                 if isinstance(proxy_data, str):
                     import json
@@ -263,10 +275,117 @@ class SpotifyAPI:
         # If we get here, we couldn't get a token
         return False
 
+    async def _extract_tokens_from_network(self, proxy: Optional[ProxyConfig] = None) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Extract Spotify tokens by monitoring network requests
+        
+        Returns:
+            Tuple[str, str]: (access_token, client_token)
+        """
+        access_token = None
+        client_token = None
+        token_event = asyncio.Event()
+        
+        try:
+            logger.info(f"Starting network-based token extraction with proxy: {proxy}")
+            async with async_playwright() as p:
+                browser_args = [
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-extensions'
+                ]
+                
+                browser = await p.chromium.launch(
+                    proxy=proxy.to_playwright_config() if proxy else None,
+                    headless=True,
+                    args=browser_args
+                )
+                
+                try:
+                    # Create a context with a credible user agent
+                    context = await browser.new_context(
+                        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+                        viewport={"width": 1280, "height": 800}
+                    )
+                    
+                    page = await context.new_page()
+                    
+                    # Intercept network requests to extract tokens
+                    async def intercept_request(route):
+                        nonlocal access_token, client_token
+                        request = route.request
+                        
+                        # Only look at API requests
+                        if "api-partner.spotify.com" in request.url or "spclient.wg.spotify.com" in request.url:
+                            headers = request.headers
+                            
+                            # Extract tokens from headers
+                            if "authorization" in headers and headers["authorization"].startswith("Bearer "):
+                                current_token = headers["authorization"].replace("Bearer ", "")
+                                
+                                # Only update if we don't have a token or if this is a different one
+                                if not access_token or access_token != current_token:
+                                    access_token = current_token
+                                    logger.info(f"Found access token: {access_token[:15]}...")
+                            
+                            if "client-token" in headers:
+                                current_client_token = headers["client-token"]
+                                
+                                # Only update if we don't have a client token or if this is a different one  
+                                if not client_token or client_token != current_client_token:
+                                    client_token = current_client_token
+                                    logger.info(f"Found client token: {client_token[:15]}...")
+                            
+                            # Signal that we've found both tokens
+                            if access_token and client_token:
+                                token_event.set()
+                        
+                        # Continue the request
+                        await route.continue_()
+                    
+                    # Set up the route handler
+                    await page.route("**/*", intercept_request)
+                    
+                    # Navigate to Spotify
+                    logger.info("Navigating to Spotify...")
+                    await page.goto('https://open.spotify.com', timeout=60000)
+                    
+                    # Wait for network activity to settle
+                    await page.wait_for_load_state('networkidle', timeout=30000)
+                    
+                    # Wait for both tokens with timeout
+                    try:
+                        await asyncio.wait_for(token_event.wait(), timeout=30)
+                        logger.info("Successfully extracted both tokens")
+                    except asyncio.TimeoutError:
+                        logger.warning("Timeout waiting for tokens")
+                        
+                        # Try navigating to a playlist page if we haven't found the tokens
+                        if not (access_token and client_token):
+                            logger.info("Trying a playlist page...")
+                            await page.goto('https://open.spotify.com/playlist/37i9dQZEVXcJZyENOWUFo7', timeout=60000)
+                            await page.wait_for_load_state('networkidle', timeout=30000)
+                            
+                            # Wait a bit more for possible requests
+                            await asyncio.sleep(5)
+                    
+                    # Return what we found
+                    return access_token, client_token
+                    
+                finally:
+                    await browser.close()
+                    logger.info("Browser closed")
+        except Exception as e:
+            logger.error(f"Error in token extraction: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        return None, None
+
     async def _get_token(self, token_type: str = 'playlist') -> bool:
         """
-        Get a new token using browser automation.
-        Enhanced version with better error handling and logging.
+        Get a new token using network monitoring approach.
         """
         for retry in range(self.MAX_RETRIES):
             try:
@@ -277,44 +396,36 @@ class SpotifyAPI:
                     await asyncio.sleep(1)
                     continue
 
-                async with self._browser_session(retry) as browser:
-                    logger.info(f"Browser launched for {token_type} token (attempt {retry + 1})")
-                    context = await browser.new_context()
-                    page = await context.new_page()
-
-                    # Set a strict timeout for the entire operation
-                    try:
-                        logger.debug(f"Opening Spotify page for {token_type} token")
-                        async with asyncio.timeout(45):  # 45 second total timeout
-                            await page.goto('https://open.spotify.com', timeout=15000)  # Reduced from 30000
-                            await page.wait_for_load_state('networkidle', timeout=15000)  # Reduced from 30000
-
-                            token_info = await page.evaluate('''() => {
-                                const script = document.getElementById('session');
-                                return script ? JSON.parse(script.text.trim()) : null;
-                            }''')
-
-                            if not token_info or not token_info.get('accessToken'):
-                                logger.error(f"No token found in page for {token_type}")
-                                continue
-
-                            self.access_token = token_info['accessToken']
-                            logger.info(f"Successfully got {token_type} token")
-
-                            # Save to Redis with current timestamp
-                            await self.cache.save_token(
-                                    token=self.access_token,
-                                    proxy=self.proxy.__dict__,
-                                    token_type=token_type
-                                    )
-                            return True
-
-                    except asyncio.TimeoutError:
-                        logger.error(f"Timeout during {token_type} token acquisition")
-                        continue
-
+                logger.info(f"Starting token extraction for {token_type} (attempt {retry + 1}/{self.MAX_RETRIES})")
+                
+                # Use the network monitoring approach to get both tokens
+                access_token, client_token = await self._extract_tokens_from_network(self.proxy)
+                
+                if access_token:
+                    self.access_token = access_token
+                    logger.info(f"Successfully got access token for {token_type}")
+                    
+                    if client_token:
+                        self.client_token = client_token
+                        logger.info(f"Successfully got client token for {token_type}")
+                    else:
+                        logger.warning(f"No client token found for {token_type}")
+                    
+                    # Save to Redis with current timestamp
+                    await self.cache.save_token(
+                        token=self.access_token,
+                        proxy=self.proxy.__dict__,
+                        token_type=token_type,
+                        client_token=self.client_token
+                    )
+                    return True
+                else:
+                    logger.error(f"No tokens found on attempt {retry + 1}")
+                    
             except Exception as e:
                 logger.error(f"Error in {token_type} token acquisition: {str(e)}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
                 self.proxy = None
                 await asyncio.sleep(1)
 
@@ -422,6 +533,95 @@ class SpotifyAPI:
 
         return bool(tracks.get('items', []))
 
+    def _transform_graphql_playlist(self, graphql_data: Dict, playlist_id: str, with_tracks: bool) -> Optional[Dict]:
+        """Transform GraphQL response to match REST API format"""
+        try:
+            # Extract playlist data from GraphQL response
+            playlist_data = graphql_data.get('data', {}).get('playlistV2', {})
+            
+            if not playlist_data:
+                logger.error("No playlist data in GraphQL response")
+                return None
+                
+            # Basic transformation - adapt based on actual response structure
+            transformed = {
+                'id': playlist_id,
+                'name': playlist_data.get('name', ''),
+                'description': playlist_data.get('description', ''),
+                'owner': {
+                    'id': playlist_data.get('ownerV2', {}).get('data', {}).get('id', ''),
+                    'display_name': playlist_data.get('ownerV2', {}).get('data', {}).get('name', '')
+                },
+                'followers': {
+                    'total': playlist_data.get('followers', 0)
+                },
+                'images': [],
+                'tracks': {
+                    'total': playlist_data.get('content', {}).get('totalCount', 0),
+                    'items': []
+                },
+                'collaborative': playlist_data.get('collaborative', False)
+            }
+            
+            # Add images if available
+            if playlist_data.get('images', {}).get('items'):
+                for img in playlist_data['images']['items']:
+                    if img.get('sources'):
+                        transformed['images'].append({
+                            'url': img['sources'][0].get('url', ''),
+                            'width': img['sources'][0].get('width', 0),
+                            'height': img['sources'][0].get('height', 0)
+                        })
+            
+            # Add tracks if requested and available
+            if with_tracks and playlist_data.get('content', {}).get('items'):
+                items = []
+                for item in playlist_data['content']['items']:
+                    try:
+                        track_data = item.get('itemV2', {}).get('data', {})
+                        if track_data and track_data.get('__typename') == 'Track':
+                            track_item = {
+                                'added_at': item.get('addedAt', ''),
+                                'track': {
+                                    'id': track_data.get('id', ''),
+                                    'name': track_data.get('name', ''),
+                                    'duration_ms': track_data.get('duration', {}).get('totalMilliseconds', 0),
+                                    'preview_url': track_data.get('previewUrl', ''),
+                                    'artists': [],
+                                    'album': {'images': []}
+                                }
+                            }
+                            
+                            # Add artists
+                            if track_data.get('artists', {}).get('items'):
+                                for artist in track_data['artists']['items']:
+                                    track_item['track']['artists'].append({
+                                        'id': artist.get('uri', '').split(':')[-1] if artist.get('uri') else '',
+                                        'name': artist.get('profile', {}).get('name', '')
+                                    })
+                            
+                            # Add album images
+                            if track_data.get('albumOfTrack', {}).get('coverArt', {}).get('sources'):
+                                for source in track_data['albumOfTrack']['coverArt']['sources']:
+                                    track_item['track']['album']['images'].append({
+                                        'url': source.get('url', ''),
+                                        'width': source.get('width', 0),
+                                        'height': source.get('height', 0)
+                                    })
+                            
+                            items.append(track_item)
+                    except Exception as e:
+                        logger.error(f"Error processing track item: {e}")
+                        continue
+                        
+                transformed['tracks']['items'] = items
+                
+            return transformed
+            
+        except Exception as e:
+            logger.error(f"Error transforming GraphQL playlist: {e}")
+            return None
+
     async def _fetch_playlist(self, playlist_id: str, with_tracks: bool = False) -> Optional[Dict]:
         try:
             await self.rate_limiter.acquire()
@@ -437,11 +637,97 @@ class SpotifyAPI:
                 logger.error("No proxy available")
                 return None
 
-            # First, fetch the basic playlist info
+            # Try GraphQL API first
+            url = "https://api-partner.spotify.com/pathfinder/v1/query"
+            
+            # Prepare variables and operation
+            variables = {
+                "uri": f"spotify:playlist:{playlist_id}",
+                "offset": 0,
+                "limit": 100 if with_tracks else 1,
+                "enableWatchFeedEntrypoint": False
+            }
+            
+            # Use the correct hash discovered from network monitoring
+            extensions = {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": "b2a084f6dcb11b3c8ab327dd79c9d8ac270f3b90691e8a249fad18b6f241df4a"
+                }
+            }
+            
+            params = {
+                "operationName": "fetchPlaylistMetadata",
+                "variables": json.dumps(variables),
+                "extensions": json.dumps(extensions)
+            }
+            
+            # Prepare headers - include client token if available
+            headers = {
+                'Authorization': f'Bearer {self.access_token}',
+                'content-type': 'application/json',
+                'accept': 'application/json',
+                'app-platform': 'WebPlayer'
+            }
+            
+            # Add client token if available
+            if hasattr(self, 'client_token') and self.client_token:
+                headers['client-token'] = self.client_token
+            
+            try:
+                async with self.session.get(
+                        url,
+                        params=params,
+                        headers=headers,
+                        proxy=self.proxy.url,
+                        proxy_auth=self.proxy.auth,
+                        timeout=10
+                        ) as response:
+                    
+                    if response.status == 200:
+                        data = await response.json()
+                        
+                        # Check for GraphQL errors
+                        if 'errors' in data:
+                            error_msg = str(data.get('errors', [{}])[0].get('message', ''))
+                            logger.warning(f"GraphQL error for playlist {playlist_id}: {error_msg}")
+                            
+                            # Fall back to REST API if GraphQL fails
+                            if "PersistedQueryNotFound" in error_msg:
+                                logger.info(f"Falling back to REST API for playlist {playlist_id}")
+                            else:
+                                # For other errors, return None
+                                return None
+                        else:
+                            # Successfully got playlist via GraphQL - transform it
+                            transformed = self._transform_graphql_playlist(data, playlist_id, with_tracks)
+                            if transformed:
+                                return transformed
+                    
+                    elif response.status in {401, 407}:
+                        # Auth error - clear tokens and proxy
+                        self.access_token = None
+                        self.client_token = None
+                        self.proxy = None
+                        logger.warning(f"Authentication error: {response.status}")
+                        return None
+                            
+            except Exception as e:
+                logger.error(f"Error in GraphQL playlist fetch: {e}")
+                # Continue to REST API fallback
+                
+            # Fall back to REST API
+            logger.info(f"Using REST API for playlist {playlist_id}")
             url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
+            
+            # Include client token in headers if available
+            headers = {'Authorization': f'Bearer {self.access_token}'}
+            if hasattr(self, 'client_token') and self.client_token:
+                headers['client-token'] = self.client_token
+                
             async with self.session.get(
                     url,
-                    headers={'Authorization': f'Bearer {self.access_token}'},
+                    headers=headers,
                     proxy=self.proxy.url,
                     proxy_auth=self.proxy.auth,
                     timeout=10
@@ -450,6 +736,7 @@ class SpotifyAPI:
                     playlist_data = await response.json()
                 elif response.status in {401, 407}:
                     self.access_token = None
+                    self.client_token = None  # Also clear client token
                     self.proxy = None
                     logger.warning(f"Failed to fetch playlist {playlist_id}: {response.status}")
                     return None
@@ -473,10 +760,15 @@ class SpotifyAPI:
                             'fields': 'items(added_at,track(id,artists(id,name),name,preview_url,duration_ms,album(images)))'
                             }
 
+                    # Include client token in headers if available  
+                    headers = {'Authorization': f'Bearer {self.access_token}'}
+                    if hasattr(self, 'client_token') and self.client_token:
+                        headers['client-token'] = self.client_token
+
                     async with self.session.get(
                             tracks_url,
                             params=params,
-                            headers={'Authorization': f'Bearer {self.access_token}'},
+                            headers=headers,
                             proxy=self.proxy.url,
                             proxy_auth=self.proxy.auth,
                             timeout=10
@@ -662,7 +954,7 @@ class SpotifyAPI:
                 }
 
     async def _fetch_artist_official(self, artist_id: str) -> Optional[Dict]:
-        """Fetch artist data from Spotify's public API"""
+        """Fetch artist data from Spotify's public API with client token"""
         try:
             await self.rate_limiter.acquire()
 
@@ -679,9 +971,15 @@ class SpotifyAPI:
 
             url = f"https://api.spotify.com/v1/artists/{artist_id}"
 
+            # Add client token to headers if available
+            headers = {'Authorization': f'Bearer {self.access_token}'}
+            
+            if hasattr(self, 'client_token') and self.client_token:
+                headers['client-token'] = self.client_token
+
             async with self.session.get(
                     url,
-                    headers={'Authorization': f'Bearer {self.access_token}'},
+                    headers=headers,
                     proxy=self.proxy.url,
                     proxy_auth=self.proxy.auth,
                     timeout=10
@@ -691,6 +989,7 @@ class SpotifyAPI:
                 elif response.status in {401, 407}:
                     logger.error(f"Authorization error {response.status}")
                     self.access_token = None
+                    self.client_token = None
                     self.proxy = None
                     return None
 
@@ -739,7 +1038,7 @@ class SpotifyAPI:
         return formatted_data
 
     async def _fetch_artist(self, artist_id: str) -> Optional[Dict]:
-        """Fetch artist data from Spotify Partner API"""
+        """Fetch artist data from Spotify Partner API with client token"""
         try:
             await self.rate_limiter.acquire()
 
@@ -776,14 +1075,21 @@ class SpotifyAPI:
                         })
                     }
 
+            # Add client token to headers if available
+            headers = {
+                'Authorization': f'Bearer {self.access_token}',
+                'content-type': 'application/json',
+                'accept': 'application/json',
+                'app-platform': 'WebPlayer'
+            }
+            
+            if hasattr(self, 'client_token') and self.client_token:
+                headers['client-token'] = self.client_token
+
             async with self.session.get(
                     url,
                     params=params,
-                    headers={
-                        'Authorization': f'Bearer {self.access_token}',
-                        'content-type': 'application/json',
-                        'accept': 'application/json'
-                        },
+                    headers=headers,
                     proxy=self.proxy.url,
                     proxy_auth=self.proxy.auth,
                     timeout=10
@@ -798,7 +1104,7 @@ class SpotifyAPI:
                             if 'data' in data and 'artistUnion' in data['data']:
                                 data['data']['artistUnion']['saved'] = False
                         else:
-                            #logger.error(f"GraphQL errors in response: {data['errors']}")
+                            logger.error(f"GraphQL errors in response: {data['errors']}")
                             return None
 
                     return data
@@ -806,6 +1112,7 @@ class SpotifyAPI:
                 elif response.status in {401, 407}:
                     logger.error(f"Authorization error {response.status}")
                     self.access_token = None
+                    self.client_token = None
                     self.proxy = None
                     return None
 
@@ -905,14 +1212,21 @@ class SpotifyAPI:
                         })
                     }
 
+            # Add client token to headers if available
+            headers = {
+                'Authorization': f'Bearer {self.access_token}',
+                'content-type': 'application/json',
+                'accept': 'application/json',
+                'app-platform': 'WebPlayer'
+            }
+            
+            if hasattr(self, 'client_token') and self.client_token:
+                headers['client-token'] = self.client_token
+
             async with self.session.get(
                     url,
                     params=params,
-                    headers={
-                        'Authorization': f'Bearer {self.access_token}',
-                        'content-type': 'application/json',
-                        'accept': 'application/json'
-                        },
+                    headers=headers,
                     proxy=self.proxy.url,
                     proxy_auth=self.proxy.auth,
                     timeout=10
@@ -939,6 +1253,7 @@ class SpotifyAPI:
                     error_body = await response.text()
                     logger.error(f"Auth error response body: {error_body}")
                     self.access_token = None
+                    self.client_token = None
                     self.proxy = None
                     # Add this line to track failures
                     await self.discovered_hash_circuit_breaker.record_failure(self, self.cache)
@@ -1153,130 +1468,9 @@ class SpotifyAPI:
                 if cached_data.get(aid)
                 }
 
-
     async def _get_track_token(self) -> bool:
-        """Get a new track token using browser automation."""
-        for retry in range(self.MAX_RETRIES):
-            try:
-                logger.info(f"Starting track token generation (attempt {retry + 1})")
-
-                if not self.proxy:
-                    self.proxy = await self._get_proxy()
-                if not self.proxy:
-                    logger.error("Failed to get proxy")
-                    continue
-
-                logger.info(f"Using proxy: {self.proxy}")
-
-                async with async_playwright() as p:
-                    browser = await p.chromium.launch(
-                            proxy=self.proxy.to_playwright_config() if self.proxy else None,
-                            headless=True,
-                            args=[
-                                '--no-sandbox',
-                                '--disable-dev-shm-usage',
-                                '--disable-gpu',
-                                '--single-process',
-                                ]
-                            )
-
-                    try:
-                        context = await browser.new_context()
-                        page = await context.new_page()
-
-                        # Track the hash we find
-                        hash_value = None
-
-                        async def handle_request(route):
-                            nonlocal hash_value
-                            url = route.request.url
-                            logger.debug(f"Intercepted request: {url}")
-                            if 'getTrack&' in url:
-                                logger.info(f"Found getTrack request: {url}")
-                                try:
-                                    # Parse URL to get the query string
-                                    parsed = urllib.parse.urlparse(url)
-                                    # Get the extensions parameter
-                                    params = urllib.parse.parse_qs(parsed.query)
-                                    if 'extensions' in params:
-                                        ext_json = urllib.parse.unquote(params['extensions'][0])
-                                        data = json.loads(ext_json)
-                                        if data.get('persistedQuery', {}).get('sha256Hash'):
-                                            hash_value = data['persistedQuery']['sha256Hash']
-                                            logger.info(f"Found track hash: {hash_value}")
-                                except Exception as e:
-                                    logger.error(f"Error parsing hash from URL: {e}")
-                            await route.continue_()
-
-                        await page.route("**/*", handle_request)
-
-                        # Navigate to a track URL
-                        url = 'https://open.spotify.com/track/6K4t31amVTZDgR3sKmwUJJ'
-                        logger.info(f"Navigating to {url}")
-                        await page.goto(url, timeout=60000)
-                        await page.wait_for_load_state('networkidle')
-                        await page.wait_for_timeout(5000)
-
-                        # Get page content for debugging if needed
-                        content = await page.content()
-                        logger.debug(f"Page content: {content[:500]}...")
-
-                        # Get token from page
-                        token_info = await page.evaluate('''() => {
-                            const script = document.getElementById('session');
-                            if (!script) {
-                                console.log('No session script found');
-                                return null;
-                            }
-                            try {
-                                return JSON.parse(script.text.trim());
-                            } catch (e) {
-                                console.log('Error parsing session script:', e);
-                                return null;
-                            }
-                        }''')
-
-                        logger.info(f"Token info found: {bool(token_info)}")
-                        logger.info(f"Hash found: {bool(hash_value)}")
-
-                        if not token_info or not token_info.get('accessToken') or not hash_value:
-                            logger.error(f"Missing track token or hash. Token: {bool(token_info)}, Hash: {bool(hash_value)}")
-                            continue
-
-                        # Store track token and hash
-                        self.access_token = token_info['accessToken']
-                        self.track_hash = hash_value
-
-                        logger.info(f"Successfully got track token. Hash: {hash_value}")
-
-                        # Save to Redis
-                        await self.cache.save_token(
-                                token=token_info['accessToken'],
-                                proxy=self.proxy.__dict__,
-                                token_type='track',
-                                hash_value=hash_value
-                                )
-
-                        return True
-
-                    except Exception as e:
-                        logger.error(f"Error during page operations: {e}")
-                        import traceback
-                        logger.error(f"Full traceback: {traceback.format_exc()}")
-                        continue
-                    finally:
-                        if browser:
-                            await browser.close()
-
-            except Exception as e:
-                logger.error(f"Error in track token acquisition: {str(e)}")
-                import traceback
-                logger.error(f"Full traceback: {traceback.format_exc()}")
-                self.proxy = None
-                await asyncio.sleep(1)
-
-        logger.error("All track token refresh attempts failed")
-        return False
+        """Get a new track token using network monitoring approach."""
+        return await self._get_token('track')  # Just reuse the common method
 
     async def get_tracks(
             self,
@@ -1341,7 +1535,7 @@ class SpotifyAPI:
                 }
 
     async def _fetch_track(self, track_id: str, detail: bool = False) -> Optional[Dict]:
-        """Fetch track data from Spotify Partner API with improved retry logic"""
+        """Fetch track data from Spotify Partner API with improved retry logic and client token"""
         for retry in range(3):  # Try up to 3 times for tracks specifically
             try:
                 await self.rate_limiter.acquire()
@@ -1398,15 +1592,22 @@ class SpotifyAPI:
                     'extensions': json.dumps(extensions)
                 }
 
+                # Add client token to headers if available
+                headers = {
+                    'Authorization': f'Bearer {self.access_token}',
+                    'content-type': 'application/json',
+                    'accept': 'application/json',
+                    'app-platform': 'WebPlayer'
+                }
+                
+                if hasattr(self, 'client_token') and self.client_token:
+                    headers['client-token'] = self.client_token
+
                 try:
                     async with self.session.get(
                             url,
                             params=params,
-                            headers={
-                                'Authorization': f'Bearer {self.access_token}',
-                                'content-type': 'application/json',
-                                'accept': 'application/json'
-                            },
+                            headers=headers,
                             proxy=self.proxy.url,
                             proxy_auth=self.proxy.auth,
                             timeout=10
@@ -1454,6 +1655,7 @@ class SpotifyAPI:
                             
                             # Clear tokens on auth errors to force fresh tokens
                             self.access_token = None
+                            self.client_token = None
                             self.proxy = None
                             
                             if retry < 2:
