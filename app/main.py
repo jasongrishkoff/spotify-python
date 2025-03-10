@@ -257,6 +257,43 @@ async def get_artists(request: ArtistRequest):
 class DiscoveredRequest(BaseModel):
 	ids: List[str]
 
+@app.on_event("startup")
+@repeat_every(seconds=600)  # Every 10 minutes
+async def monitor_discovered_hash():
+    """Proactively test and refresh the discovered hash if needed"""
+    try:
+        # Test current hash with a simple request
+        test_artist_id = "3GBPw9NK25X1Wt2OUvOwY3"  # A reliable artist ID to test with
+        
+        # First check if we have a hash
+        if not await redis_cache.get_discovered_hash():
+            logger.warning("No discovered hash found, triggering refresh")
+            await spotify_api._get_discovered_hash()
+            return
+            
+        # Try to fetch artist data with current hash
+        try:
+            # Use a short timeout for test
+            async with asyncio.timeout(5):
+                test_result = await spotify_api._fetch_discovered_on(test_artist_id)
+                
+            # Check if result is valid
+            if not test_result or 'errors' in test_result:
+                logger.warning("Discovered hash test failed, triggering refresh")
+                # Delete old hash
+                await redis_cache.redis.delete('spotify_discovered_hash')
+                # Get new hash
+                await spotify_api._get_discovered_hash()
+            else:
+                logger.info("Discovered hash test successful")
+        except Exception as e:
+            logger.error(f"Error testing discovered hash: {e}")
+            # Attempt refresh if test fails
+            await spotify_api._get_discovered_hash()
+            
+    except Exception as e:
+        logger.error(f"Error in discovered hash monitoring: {e}")
+
 @app.get("/api/discovered-on/{artist_id}")
 async def get_discovered_on(
 	artist_id: str,
