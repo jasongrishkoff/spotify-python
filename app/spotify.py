@@ -258,7 +258,7 @@ class SpotifyAPI:
                 logger.error(f"Error closing session: {e}")
 
     async def _get_proxy(self) -> Optional[ProxyConfig]:
-        if self.proxy:
+        if self.proxy and time.time() - self.proxy.created_at < 1800:  # 30-minute reuse
             return self.proxy
 
         try:
@@ -267,9 +267,28 @@ class SpotifyAPI:
 
             async with self.session.get('https://api.submithub.com/api/proxy', timeout=15) as response:
                 if response.status == 200:
-                    self.proxy = ProxyConfig.from_response(await response.json())
-                    logger.info(f"Got proxy: {self.proxy}")
-                    return self.proxy
+                    proxy_data = await response.json()
+                    # Test the proxy before returning it
+                    proxy = ProxyConfig.from_response(proxy_data)
+                    
+                    # Verify proxy works with a simple connection test
+                    test_url = "https://httpbin.org/ip"
+                    try:
+                        async with self.session.get(
+                            test_url,
+                            proxy=proxy.url,
+                            proxy_auth=proxy.auth,
+                            timeout=5
+                        ) as test_response:
+                            if test_response.status == 200:
+                                logger.info(f"Proxy test successful: {proxy}")
+                                self.proxy = proxy
+                                return proxy
+                            else:
+                                logger.error(f"Proxy test failed with status: {test_response.status}")
+                    except Exception as e:
+                        logger.error(f"Proxy test connection error: {e}")
+                        return None
                 logger.error(f"Failed to get proxy, status: {response.status}")
         except Exception as e:
             logger.error(f"Proxy error: {e}")
@@ -955,6 +974,13 @@ class SpotifyAPI:
             logger.info(f"Using REST API for playlist {playlist_id}")
             url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
             
+            if with_tracks:
+                fields = "id,name,description,owner(id,display_name),followers(total),images,collaborative,tracks(total,items(added_at,track(id,name,duration_ms,preview_url,artists(id,name),album(images,name))))"
+            else:
+                fields = "id,name,description,owner(id,display_name),followers(total),images,tracks(total),collaborative"
+
+            params = {'fields': fields}
+
             # Include client token in headers if available
             headers = {'Authorization': f'Bearer {self.access_token}'}
             if hasattr(self, 'client_token') and self.client_token:
@@ -962,6 +988,7 @@ class SpotifyAPI:
                 
             async with self.session.get(
                     url,
+                    params=params,
                     headers=headers,
                     proxy=self.proxy.url,
                     proxy_auth=self.proxy.auth,
@@ -1212,8 +1239,15 @@ class SpotifyAPI:
             if hasattr(self, 'client_token') and self.client_token:
                 headers['client-token'] = self.client_token
 
+            if not detail:
+                params = {
+                    'fields': 'id,name,followers,popularity,images'
+                }
+            else:
+                params = {}
             async with self.session.get(
                     url,
+                    params=params,
                     headers=headers,
                     proxy=self.proxy.url,
                     proxy_auth=self.proxy.auth,
