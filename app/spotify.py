@@ -766,120 +766,8 @@ class SpotifyAPI:
 
         return bool(tracks.get('items', []))
 
-    def _transform_graphql_playlist(self, graphql_data: Dict, playlist_id: str, with_tracks: bool) -> Optional[Dict]:
-        """Transform GraphQL response to match REST API format"""
-        try:
-            # Extract playlist data from GraphQL response
-            playlist_data = graphql_data.get('data', {}).get('playlistV2', {})
-            
-            if not playlist_data:
-                logger.error("No playlist data in GraphQL response")
-                return None
-                
-            # Basic transformation with playlist fields
-            transformed = {
-                'id': playlist_id,
-                'name': playlist_data.get('name', ''),
-                'description': playlist_data.get('description', ''),
-                'owner': {
-                    'id': playlist_data.get('ownerV2', {}).get('data', {}).get('id', ''),
-                    'display_name': playlist_data.get('ownerV2', {}).get('data', {}).get('name', '')
-                },
-                'followers': {
-                    'total': playlist_data.get('followers', 0)
-                },
-                'images': [],
-                'tracks': {
-                    'total': playlist_data.get('content', {}).get('totalCount', 0),
-                    'items': []
-                },
-                'collaborative': playlist_data.get('collaborative', False)
-            }
-            
-            # Add images if available
-            if playlist_data.get('images', {}).get('items'):
-                for img in playlist_data['images']['items']:
-                    if img.get('sources'):
-                        transformed['images'].append({
-                            'url': img['sources'][0].get('url', ''),
-                            'width': img['sources'][0].get('width', 0),
-                            'height': img['sources'][0].get('height', 0)
-                        })
-            
-            # Add tracks if requested and available
-            if with_tracks and playlist_data.get('content', {}).get('items'):
-                items = []
-                for item in playlist_data['content']['items']:
-                    try:
-                        track_data = item.get('itemV2', {}).get('data', {})
-                        if track_data and track_data.get('__typename') == 'Track':
-                            # Extract ID from URI (spotify:track:TRACK_ID)
-                            track_id = ''
-                            if track_data.get('uri'):
-                                parts = track_data['uri'].split(':')
-                                if len(parts) == 3 and parts[1] == 'track':
-                                    track_id = parts[2]
-                            
-                            track_item = {
-                                # Get the actual ISO timestamp from addedAt.isoString
-                                'added_at': item.get('addedAt', {}).get('isoString', ''),
-                                'track': {
-                                    'id': track_id,
-                                    # Get actual track name
-                                    'name': track_data.get('name', ''),
-                                    'duration_ms': track_data.get('trackDuration', {}).get('totalMilliseconds', 0),
-                                    'preview_url': track_data.get('previewUrl', ''),
-                                    'artists': [],
-                                    'album': {'images': []}
-                                }
-                            }
-                            
-                            # Add artists properly
-                            if track_data.get('artists', {}).get('items'):
-                                for artist in track_data['artists']['items']:
-                                    artist_id = ''
-                                    if artist.get('uri'):
-                                        parts = artist['uri'].split(':')
-                                        if len(parts) == 3 and parts[1] == 'artist':
-                                            artist_id = parts[2]
-                                    
-                                    track_item['track']['artists'].append({
-                                        'id': artist_id,
-                                        'name': artist.get('profile', {}).get('name', '')
-                                    })
-                            
-                            # Add album images properly
-                            if track_data.get('albumOfTrack', {}).get('coverArt', {}).get('sources'):
-                                for source in track_data['albumOfTrack']['coverArt']['sources']:
-                                    track_item['track']['album']['images'].append({
-                                        'url': source.get('url', ''),
-                                        'width': source.get('width', 0),
-                                        'height': source.get('height', 0)
-                                    })
-                                    
-                            # Add album name
-                            if track_data.get('albumOfTrack', {}).get('name'):
-                                track_item['track']['album']['name'] = track_data['albumOfTrack']['name']
-                            
-                            items.append(track_item)
-                    except Exception as e:
-                        logger.error(f"Error processing track item: {e}")
-                        import traceback
-                        logger.error(f"Traceback: {traceback.format_exc()}")
-                        continue
-                        
-                transformed['tracks']['items'] = items
-                
-            return transformed
-            
-        except Exception as e:
-            logger.error(f"Error transforming GraphQL playlist: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            return None
-    
     async def _fetch_playlist(self, playlist_id: str, with_tracks: bool = False) -> Optional[Dict]:
-        """Fetch playlist data using dynamically captured hashes"""
+        """Fetch playlist data using Spotify's REST API only"""
         try:
             await self.rate_limiter.acquire()
 
@@ -894,91 +782,7 @@ class SpotifyAPI:
                 self.logger.error("No proxy available")
                 return None
 
-            url = "https://api-partner.spotify.com/pathfinder/v1/query"
-            
-            # Modified variables to ensure we get the right fields
-            variables = {
-                "uri": f"spotify:playlist:{playlist_id}",
-                "offset": 0,
-                "limit": 100 if with_tracks else 1,
-                "locale": "",
-                "includePrerelease": True,
-                "enableWatchFeedEntrypoint": False
-            }
-            
-            # Get hash from hash manager
-            #playlist_hash = await self.hash_manager.get_hash('fetchPlaylistMetadata')
-            playlist_hash = await self.hash_manager.get_hash('fetchPlaylist')
-            
-            extensions = {
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": playlist_hash
-                }
-            }
-            
-            params = {
-                "operationName": "fetchPlaylist",
-                "variables": json.dumps(variables),
-                "extensions": json.dumps(extensions)
-            }
-            
-            # Add client token to headers if available
-            headers = {
-                'Authorization': f'Bearer {self.access_token}',
-                'content-type': 'application/json',
-                'accept': 'application/json',
-                'app-platform': 'WebPlayer'
-            }
-            
-            if hasattr(self, 'client_token') and self.client_token:
-                headers['client-token'] = self.client_token
-            
-            try:
-                async with self.session.get(
-                        url,
-                        params=params,
-                        headers=headers,
-                        proxy=self.proxy.url,
-                        proxy_auth=self.proxy.auth,
-                        timeout=10
-                        ) as response:
-                    
-                    if response.status == 200:
-                        data = await response.json()
-                        
-                        # Check for GraphQL errors
-                        if 'errors' in data:
-                            error_msg = str(data.get('errors', [{}])[0].get('message', ''))
-                            self.logger.warning(f"GraphQL error for playlist {playlist_id}: {error_msg}")
-                            
-                            if "PersistedQueryNotFound" in error_msg:
-                                # Clear hash to force refresh
-                                #await self.hash_manager.save_hash('fetchPlaylistMetadata', None)
-                                await self.hash_manager.save_hash('fetchPlaylist', None)
-                                self.logger.info(f"Clearing playlist hash, falling back to REST API")
-                            else:
-                                # For other errors, return None
-                                return None
-                        else:
-                            # Successfully got playlist via GraphQL - transform it
-                            transformed = self._transform_graphql_playlist(data, playlist_id, with_tracks)
-                            if transformed:
-                                return transformed
-                    
-                    elif response.status in {401, 407}:
-                        # Auth error - clear tokens and proxy
-                        self.access_token = None
-                        self.client_token = None
-                        self.proxy = None
-                        self.logger.warning(f"Authentication error: {response.status}")
-                        return None
-                            
-            except Exception as e:
-                self.logger.error(f"Error in GraphQL playlist fetch: {e}")
-
-            # Fall back to REST API
-            logger.info(f"Using REST API for playlist {playlist_id}")
+            # REST API for playlists
             url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
             
             if with_tracks:
@@ -988,7 +792,6 @@ class SpotifyAPI:
 
             params = {'fields': fields}
 
-            # Include client token in headers if available
             headers = {'Authorization': f'Bearer {self.access_token}'}
             if hasattr(self, 'client_token') and self.client_token:
                 headers['client-token'] = self.client_token
@@ -1005,7 +808,7 @@ class SpotifyAPI:
                     playlist_data = await response.json()
                 elif response.status in {401, 407}:
                     self.access_token = None
-                    self.client_token = None  # Also clear client token
+                    self.client_token = None
                     self.proxy = None
                     logger.warning(f"Failed to fetch playlist {playlist_id}: {response.status}")
                     return None
@@ -1026,10 +829,9 @@ class SpotifyAPI:
                     params = {
                             'offset': offset,
                             'limit': limit,
-                            'fields': 'items(added_at,track(id,artists(id,name),name,preview_url,duration_ms,album(images)))'
+                            'fields': 'items(added_at,track(id,artists(id,name),name,preview_url,duration_ms,album(images,name)))'
                             }
 
-                    # Include client token in headers if available  
                     headers = {'Authorization': f'Bearer {self.access_token}'}
                     if hasattr(self, 'client_token') and self.client_token:
                         headers['client-token'] = self.client_token
