@@ -427,8 +427,10 @@ class SpotifyAPI:
                 browser_args = [
                     '--no-sandbox',
                     '--disable-dev-shm-usage',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-extensions'
+                    '--disable-gpu',
+                    '--disable-features=IsolateOrigins,site-per-process',  # Add this
+                    '--disable-web-security',  # Add this
+                    '--disable-blink-features=AutomationControlled'  # Add this
                 ]
                 
                 browser = await p.chromium.launch(
@@ -440,8 +442,12 @@ class SpotifyAPI:
                 try:
                     # Create a context with a credible user agent
                     context = await browser.new_context(
-                        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-                        viewport={"width": 1280, "height": 800}
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+                        viewport={"width": 1280, "height": 800},
+                        locale="en-US",
+                        timezone_id="America/New_York",
+                        permissions=["geolocation"],
+                        java_script_enabled=True
                     )
                     
                     page = await context.new_page()
@@ -513,7 +519,19 @@ class SpotifyAPI:
                     
                     # Navigate to Spotify
                     self.logger.info("Navigating to Spotify main page...")
-                    await page.goto('https://open.spotify.com', timeout=60000)
+                    #await page.goto('https://open.spotify.com', timeout=60000)
+                    try:
+                        await page.goto('https://open.spotify.com',
+                                       timeout=30000,  # Shorter timeout
+                                       wait_until='domcontentloaded')  # Don't wait for full page load
+                    except Exception as e:
+                        self.logger.warning(f"Initial navigation error: {e}, trying simplified approach")
+                        # Try a different approach if the main navigation fails
+                        await page.set_content("<html><body></body></html>")
+                        await page.evaluate("""() => {
+                            window.location.href = "https://open.spotify.com";
+                        }""")
+                        await page.wait_for_load_state('domcontentloaded', timeout=30000)
                     
                     # Wait for network activity to settle
                     await page.wait_for_load_state('networkidle', timeout=30000)
