@@ -370,7 +370,15 @@ class SpotifyAPI:
         """
         # Quick check if we already have a valid token
         if self.access_token and self.proxy:
-            return True
+            # Verify the proxy is still valid with lightweight test
+            if await self._verify_proxy():
+                return True
+            else:
+                # Proxy is invalid, clear it
+                logger.warning("Proxy validation failed, clearing token and proxy")
+                self.access_token = None
+                self.client_token = None
+                self.proxy = None
 
         # Check cache first
         if cached := await self.cache.get_token(token_type):
@@ -391,7 +399,17 @@ class SpotifyAPI:
                     proxy_data = json.loads(proxy_data)
 
                 self.proxy = ProxyConfig(**proxy_data)
-                return True
+                
+                # Verify the proxy is still valid
+                if await self._verify_proxy():
+                    return True
+                else:
+                    # Proxy is invalid, clear token from cache
+                    logger.warning(f"Proxy validation failed for cached {token_type} token, forcing refresh")
+                    await self.cache.clear_token(token_type)
+                    self.access_token = None
+                    self.client_token = None
+                    self.proxy = None
 
         # Use exponential backoff for waiting
         max_attempts = 3  # Reduced from 5 to minimize blocking
@@ -412,7 +430,16 @@ class SpotifyAPI:
                             import json
                             proxy_data = json.loads(proxy_data)
                         self.proxy = ProxyConfig(**proxy_data)
-                        return True
+                        
+                        # Verify the proxy is still valid
+                        if await self._verify_proxy():
+                            return True
+                        else:
+                            # Proxy is invalid, clear it and continue to refresh
+                            logger.warning(f"Proxy validation failed for cached {token_type} token, continuing to refresh")
+                            self.access_token = None
+                            self.client_token = None
+                            self.proxy = None
 
                     # Get a new token
                     success = await self._get_token(token_type)
@@ -441,10 +468,41 @@ class SpotifyAPI:
                     import json
                     proxy_data = json.loads(proxy_data)
                 self.proxy = ProxyConfig(**proxy_data)
-                return True
+                
+                # Verify the proxy is still valid
+                if await self._verify_proxy():
+                    return True
 
         # If we get here, we couldn't get a token
         return False
+
+    async def _verify_proxy(self) -> bool:
+        """
+        Verify that the current proxy is still valid with a lightweight test.
+        """
+        if not self.proxy:
+            return False
+            
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+            
+        try:
+            # Use a very simple request to verify proxy
+            test_url = "https://httpbin.org/ip"
+            async with self.session.get(
+                test_url,
+                proxy=self.proxy.url,
+                proxy_auth=self.proxy.auth,
+                timeout=3  # Very short timeout for quick validation
+            ) as test_response:
+                if test_response.status == 200:
+                    return True
+                else:
+                    logger.warning(f"Proxy validation failed with status: {test_response.status}")
+                    return False
+        except Exception as e:
+            logger.warning(f"Proxy validation error: {e}")
+            return False
 
     async def capture_tokens_and_hashes(self, proxy=None) -> Tuple[Optional[str], Optional[str], Dict[str, str]]:
         """
