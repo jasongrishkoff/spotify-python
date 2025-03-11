@@ -305,18 +305,42 @@ class SpotifyAPI:
         try:
             logger.info(f"Starting browser (attempt {retry_count + 1}/{self.MAX_RETRIES})")
             async with async_playwright() as p:
+                browser_args = [
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--disable-features=IsolateOrigins,site-per-process',
+                    '--disable-web-security',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-extensions',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disk-cache-size=0',
+                    '--media-cache-size=0',
+                    '--aggressive-cache-discard',
+                    '--disable-cache',
+                    '--disable-application-cache',
+                    '--disable-offline-load-stale-cache',
+                    '--disable-software-rasterizer',
+                    '--disable-background-networking',
+                    '--ignore-certificate-errors'
+                ]
+                
                 browser = await p.chromium.launch(
                         proxy=self.proxy.to_playwright_config() if self.proxy else None,
                         headless=True,
-                        args=[
-                            '--no-sandbox',
-                            '--disable-dev-shm-usage',
-                            '--disable-gpu',
-                            '--single-process',
-                            ]
+                        args=browser_args,
+                        timeout=60000  # Increase timeout to 60s for slow environments
                         )
                 # Create the context immediately after launching the browser
-                context = await browser.new_context()
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+                    viewport={"width": 1280, "height": 800},
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    permissions=["geolocation"],
+                    java_script_enabled=True,
+                    bypass_csp=True
+                )
                 yield browser
         except Exception as e:
             logger.error(f"Browser session error: {str(e)}")
@@ -612,58 +636,66 @@ class SpotifyAPI:
         
         return access_token, client_token, operation_hashes
 
-    async def _get_token(self, token_type: str = 'playlist') -> bool:
-        """
-        Get a new token using network monitoring approach and update hashes.
-        """
-        for retry in range(self.MAX_RETRIES):
+    async def _get_proxy(self) -> Optional[ProxyConfig]:
+        if self.proxy and time.time() - self.proxy.created_at < 1800:  # 30-minute reuse
+            return self.proxy
+
+        # Try to get a new proxy with retries
+        for attempt in range(3):
             try:
-                if not self.proxy:
-                    self.proxy = await self._get_proxy()
-                if not self.proxy:
-                    self.logger.error(f"Failed to get proxy on attempt {retry + 1}")
-                    await asyncio.sleep(1)
-                    continue
+                if not self.session:
+                    self.session = aiohttp.ClientSession()
 
-                self.logger.info(f"Starting token extraction for {token_type} (attempt {retry + 1}/{self.MAX_RETRIES})")
-                
-                # Capture tokens and hashes
-                access_token, client_token, operation_hashes = await self.capture_tokens_and_hashes(self.proxy)
-                
-                if access_token:
-                    self.access_token = access_token
-                    self.logger.info(f"Successfully got access token for {token_type}")
-                    
-                    if client_token:
-                        self.client_token = client_token
-                        self.logger.info(f"Successfully got client token for {token_type}")
-                    else:
-                        self.logger.warning(f"No client token found for {token_type}")
-                    
-                    # Update hashes in the hash manager
-                    if operation_hashes:
-                        await self.hash_manager.update_hashes(operation_hashes)
-                    
-                    # Save to Redis with current timestamp
-                    await self.cache.save_token(
-                        token=self.access_token,
-                        proxy=self.proxy.__dict__,
-                        token_type=token_type,
-                        client_token=self.client_token
-                    )
-                    return True
-                else:
-                    self.logger.error(f"No tokens found on attempt {retry + 1}")
-                    
+                async with self.session.get('https://api.submithub.com/api/proxy', timeout=15) as response:
+                    if response.status == 200:
+                        proxy_data = await response.json()
+                        # Test the proxy before returning it
+                        proxy = ProxyConfig.from_response(proxy_data)
+                        
+                        # Verify proxy works with a simple connection test
+                        test_url = "https://httpbin.org/ip"
+                        try:
+                            async with self.session.get(
+                                test_url,
+                                proxy=proxy.url,
+                                proxy_auth=proxy.auth,
+                                timeout=5
+                            ) as test_response:
+                                if test_response.status == 200:
+                                    logger.info(f"Proxy test successful: {proxy}")
+                                    self.proxy = proxy
+                                    return proxy
+                                else:
+                                    logger.error(f"Proxy test failed with status: {test_response.status}")
+                        except Exception as e:
+                            logger.error(f"Proxy test connection error: {e}")
+                            await asyncio.sleep(1)  # Brief pause before retry
+                            continue
+                    logger.error(f"Failed to get proxy, status: {response.status}")
             except Exception as e:
-                self.logger.error(f"Error in {token_type} token acquisition: {str(e)}")
-                import traceback
-                self.logger.error(f"Traceback: {traceback.format_exc()}")
-                self.proxy = None
+                logger.error(f"Proxy error: {e}")
                 await asyncio.sleep(1)
-
-        self.logger.error(f"All {token_type} token refresh attempts failed")
-        return False
+                
+        # If we reach here, all attempts failed
+        # Use a fallback from the cache if available
+        try:
+            # Try to find any valid token in cache and use its proxy
+            for token_type in ['playlist', 'artist', 'track']:
+                if cached := await self.cache.get_token(token_type):
+                    proxy_data = cached['proxy']
+                    if isinstance(proxy_data, str):
+                        import json
+                        proxy_data = json.loads(proxy_data)
+                    
+                    # Create proxy object
+                    proxy = ProxyConfig(**proxy_data)
+                    logger.warning(f"Using fallback proxy from cache: {proxy}")
+                    self.proxy = proxy
+                    return proxy
+        except Exception as e:
+            logger.error(f"Error using fallback proxy: {e}")
+            
+        return None
 
     async def get_playlists(
             self,
