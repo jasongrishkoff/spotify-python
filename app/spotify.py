@@ -1239,15 +1239,8 @@ class SpotifyAPI:
             if hasattr(self, 'client_token') and self.client_token:
                 headers['client-token'] = self.client_token
 
-            if not detail:
-                params = {
-                    'fields': 'id,name,followers,popularity,images'
-                }
-            else:
-                params = {}
             async with self.session.get(
                     url,
-                    params=params,
                     headers=headers,
                     proxy=self.proxy.url,
                     proxy_auth=self.proxy.auth,
