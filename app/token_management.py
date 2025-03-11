@@ -478,6 +478,16 @@ class SpotifyAPIEnhanced(SpotifyAPI):
             
         # Use token manager to ensure token
         return await self.token_manager.ensure_token(token_type)
+        
+    # Explicitly delegate to parent's _get_token method
+    async def _get_token(self, token_type: str = 'playlist') -> bool:
+        """Explicitly delegate to parent class implementation"""
+        return await SpotifyAPI._get_token(self, token_type)
+        
+    # Also explicitly delegate the _get_track_token method
+    async def _get_track_token(self) -> bool:
+        """Explicitly delegate to parent class implementation"""
+        return await SpotifyAPI._get_track_token(self)
 
 # Setup function - keeping the original signature
 async def setup_token_management(app, spotify_api, redis_cache):
