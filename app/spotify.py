@@ -87,7 +87,8 @@ class GraphQLHashManager:
         
         # Define the operations we want to track hashes for
         self.operations = {
-            'fetchPlaylistMetadata',
+            #'fetchPlaylistMetadata',
+            'fetchPlaylist',
             'queryArtistOverview',
             'getTrack',
             'queryArtistDiscoveredOn'
@@ -95,7 +96,8 @@ class GraphQLHashManager:
         
         # Fallback hashes to use if no dynamic hash is available
         self.fallback_hashes = {
-            'fetchPlaylistMetadata': 'b2a084f6dcb11b3c8ab327dd79c9d8ac270f3b90691e8a249fad18b6f241df4a',
+            #'fetchPlaylistMetadata': 'b2a084f6dcb11b3c8ab327dd79c9d8ac270f3b90691e8a249fad18b6f241df4a',
+            'fetchPlaylist': 'b2a084f6dcb11b3c8ab327dd79c9d8ac270f3b90691e8a249fad18b6f241df4a',
             'queryArtistOverview': '4bc52527bb77a5f8bbb9afe491e9aa725698d29ab73bff58d49169ee29800167',
             'getTrack': '26cd58ab86ebba80196c41c3d48a4324c619e9a9d7df26ecca22417e0c50c6a4',
             'queryArtistDiscoveredOn': '994dde7e4c15f5ed5bae63716cfbda9fdf75bca5f534142da3397fc2596be62b'
@@ -103,7 +105,8 @@ class GraphQLHashManager:
         
         # Map the operation names to endpoints for clearer logging
         self.operation_to_endpoint = {
-            'fetchPlaylistMetadata': 'playlist',
+            #'fetchPlaylistMetadata': 'playlist',
+            'fetchPlaylist': 'playlist',
             'queryArtistOverview': 'artist',
             'getTrack': 'track',
             'queryArtistDiscoveredOn': 'discovered-on'
@@ -148,7 +151,7 @@ class GraphQLHashManager:
         
         # Finally use fallback
         if operation_name in self.fallback_hashes:
-            self.logger.warning(f"Using fallback hash for {operation_name}")
+            #self.logger.warning(f"Using fallback hash for {operation_name}")
             return self.fallback_hashes[operation_name]
             
         # If all else fails, return None
@@ -434,7 +437,8 @@ class SpotifyAPI:
         # Track which operations we've seen
         operations_seen = set()
         operations_to_capture = {
-            'fetchPlaylistMetadata', 
+            #'fetchPlaylistMetadata', 
+            'fetchPlaylist', 
             'queryArtistOverview', 
             'getTrack', 
             'queryArtistDiscoveredOn'
@@ -566,7 +570,8 @@ class SpotifyAPI:
                     # We'll visit specific pages to trigger the API calls we need
                     
                     # Try to capture playlist hash if missing
-                    if 'fetchPlaylistMetadata' not in operations_seen:
+                    #if 'fetchPlaylistMetadata' not in operations_seen:
+                    if 'fetchPlaylist' not in operations_seen:
                         self.logger.info("Navigating to playlist page to capture hash...")
                         await page.goto('https://open.spotify.com/playlist/37i9dQZEVXcJZyENOWUFo7', timeout=60000)
                         await page.wait_for_load_state('networkidle', timeout=30000)
@@ -902,7 +907,8 @@ class SpotifyAPI:
             }
             
             # Get hash from hash manager
-            playlist_hash = await self.hash_manager.get_hash('fetchPlaylistMetadata')
+            #playlist_hash = await self.hash_manager.get_hash('fetchPlaylistMetadata')
+            playlist_hash = await self.hash_manager.get_hash('fetchPlaylist')
             
             extensions = {
                 "persistedQuery": {
@@ -948,7 +954,8 @@ class SpotifyAPI:
                             
                             if "PersistedQueryNotFound" in error_msg:
                                 # Clear hash to force refresh
-                                await self.hash_manager.save_hash('fetchPlaylistMetadata', None)
+                                #await self.hash_manager.save_hash('fetchPlaylistMetadata', None)
+                                await self.hash_manager.save_hash('fetchPlaylist', None)
                                 self.logger.info(f"Clearing playlist hash, falling back to REST API")
                             else:
                                 # For other errors, return None

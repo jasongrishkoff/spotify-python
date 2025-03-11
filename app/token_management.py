@@ -1,215 +1,290 @@
+# In app/token_management.py
+
 import asyncio
 import logging
 import time
 import random
-from fastapi import BackgroundTasks
-from typing import Optional, Dict, List
+import os
+import json
+from typing import Optional, Dict
 from .spotify import SpotifyAPI, ProxyConfig
 
 logger = logging.getLogger(__name__)
 
 class TokenManager:
     """
-    Manages token generation and refreshing in a non-blocking way
+    Token manager that can operate in both leader and follower modes.
+    
+    In a multi-worker environment (Gunicorn), only one worker becomes the token 
+    refresh leader while others operate as followers who only consume tokens.
     """
+    
     def __init__(self, spotify_api, redis_cache):
         self.spotify_api = spotify_api
         self.redis_cache = redis_cache
         self.token_types = ['playlist', 'artist', 'track']
         self.refresh_tasks = {}
-        self.refresh_in_progress = {token_type: False for token_type in self.token_types}
-        self.refresh_interval = 120  # 2 minutes
-        self.token_validity = 240  # 4 minutes
+        self.is_leader = False
+        self.leader_check_interval = 30  # Check leader status every 30 seconds
+        self.instance_id = f"{os.getpid()}_{random.randint(1000, 9999)}"
+        self.leader_key = "token_manager_leader"
+        self.leader_lock_duration = 60  # 1 minute leadership lock
         self._startup_complete = False
+        self.refresh_in_progress = {token_type: False for token_type in self.token_types}
+        
+        # Token refresh configuration
+        self.refresh_interval = 240  # 4 minutes
+        self.token_validity = 480    # 8 minutes
+        self.discovered_hash_refresh_interval = 12 * 3600  # 12 hours
+        
+        logger.info(f"Initializing token manager with instance ID: {self.instance_id}")
 
     async def initialize(self):
-        """Initialize with better cross-process coordination"""
+        """Initialize the token manager"""
         logger.info("Initializing token manager")
-
-        # Start with a clean slate - clear any stale refresh flags
-        for token_type in self.token_types:
-            await self.redis_cache.redis.delete(f"refreshing_{token_type}")
-
+        
         # For each token type, check if we have a valid token
         for token_type in self.token_types:
             try:
                 if cached := await self.redis_cache.get_token(token_type):
                     # Set the token in memory
                     self.spotify_api.access_token = cached['access_token']
-
+                    
+                    # Also set client token if available
+                    if 'client_token' in cached:
+                        self.spotify_api.client_token = cached['client_token']
+                    
                     proxy_data = cached['proxy']
                     if isinstance(proxy_data, str):
+                        import json
                         proxy_data = json.loads(proxy_data)
-
+                    
                     self.spotify_api.proxy = ProxyConfig(**proxy_data)
-
-                    # Also set hash for track tokens
-                    if token_type == 'track' and 'hash_value' in cached:
-                        self.spotify_api.track_hash = cached['hash_value']
-
                     logger.info(f"Loaded {token_type} token from cache")
                 else:
-                    # No valid token, trigger a refresh
-                    logger.info(f"No valid {token_type} token, refreshing")
-                    await self._refresh_token(token_type)
-                    # Add delay between refreshes to prevent resource contention
-                    await asyncio.sleep(3)
+                    logger.warning(f"No {token_type} token available in cache")
             except Exception as e:
                 logger.error(f"Error initializing {token_type} token: {e}")
-
+        
+        # Initialize GraphQL hash manager
+        if hasattr(self.spotify_api, 'hash_manager'):
+            await self.spotify_api.hash_manager.initialize()
+        
         self._startup_complete = True
         logger.info("Token manager initialization complete")
 
     async def start_background_refreshing(self):
-        """Start background refreshing tasks for all token types"""
+        """
+        Start background refreshing tasks.
+        This maintains the original method name for backward compatibility.
+        """
+        await self.start()
+
+    async def start(self):
+        """Start the token manager"""
         if not self._startup_complete:
-            logger.warning("Attempting to start background refreshing before initialization")
             await self.initialize()
+        
+        # Start background tasks
+        # 1. Leadership election task
+        asyncio.create_task(self.leadership_check_loop())
+        
+        logger.info("Token manager started")
 
+    async def leadership_check_loop(self):
+        """Periodically check and attempt to become the leader"""
+        logger.info("Starting leadership check loop")
+        
+        while True:
+            try:
+                # Check if there's a current leader
+                current_leader = await self.redis_cache.redis.get(self.leader_key)
+                
+                # Fix: Handle both string and bytes without assuming decode is needed
+                if current_leader is None or current_leader == self.instance_id:
+                    # No leader or we are the current leader
+                    # Try to claim or renew leadership
+                    result = await self.redis_cache.redis.set(
+                        self.leader_key,
+                        self.instance_id,
+                        ex=self.leader_lock_duration,
+                        nx=(current_leader is None)  # Only use NX if there's no current leader
+                    )
+                    
+                    # If we weren't the leader before but are now, start refresh tasks
+                    if not self.is_leader and (result or current_leader == self.instance_id):
+                        logger.info(f"Instance {self.instance_id} became the token refresh leader")
+                        self.is_leader = True
+                        self._start_refresh_tasks()
+                        
+                        # Log current state of tokens
+                        for token_type in self.token_types:
+                            if cached := await self.redis_cache.get_token(token_type):
+                                proxy_data = cached['proxy']
+                                created_at = proxy_data.get('created_at', 0) if isinstance(proxy_data, dict) else 0
+                                age = int(time.time()) - created_at
+                                logger.info(f"Current {token_type} token age: {age}s")
+                        
+                elif self.is_leader:
+                    # We were the leader but someone else has taken over
+                    logger.info(f"Instance {self.instance_id} is no longer the token refresh leader")
+                    self.is_leader = False
+                    self._stop_refresh_tasks()
+            except Exception as e:
+                logger.error(f"Error in leadership check: {e}")
+                
+            # Check every 30 seconds
+            await asyncio.sleep(self.leader_check_interval)
+
+    def _start_refresh_tasks(self):
+        """Start token refresh tasks when becoming the leader"""
+        logger.info("Starting token refresh tasks")
+        
+        # Start token refresh tasks
         for token_type in self.token_types:
-            self._schedule_refresh(token_type)
-
-        # Schedule discovered hash refresh
-        self._schedule_discovered_hash_refresh()
-
-        logger.info("Background token refreshing started")
-
-    def _schedule_refresh(self, token_type: str):
-        """Schedule a token refresh with jitter"""
-        if token_type in self.refresh_tasks and not self.refresh_tasks[token_type].done():
-            #logger.debug(f"Refresh task for {token_type} already scheduled")
-            return
-
-        # Calculate next refresh time with jitter (±30 seconds)
-        jitter = random.uniform(-30, 30)
-        next_refresh = self.refresh_interval + jitter
-
-        logger.debug(f"Scheduling {token_type} token refresh in {next_refresh:.1f} seconds")
-
-        # Create and store the task
-        self.refresh_tasks[token_type] = asyncio.create_task(
-                self._delayed_refresh(token_type, next_refresh)
+            if token_type not in self.refresh_tasks or self.refresh_tasks[token_type].done():
+                self.refresh_tasks[token_type] = asyncio.create_task(
+                    self._token_refresh_loop(token_type)
                 )
+                
+        # Start discovered hash refresh task
+        if 'discovered_hash' not in self.refresh_tasks or self.refresh_tasks['discovered_hash'].done():
+            self.refresh_tasks['discovered_hash'] = asyncio.create_task(
+                self._discovered_hash_refresh_loop()
+            )
 
-    def _schedule_discovered_hash_refresh(self):
-        """Schedule a discovered hash refresh"""
-        if 'discovered_hash' in self.refresh_tasks and not self.refresh_tasks['discovered_hash'].done():
-            return
+    def _stop_refresh_tasks(self):
+        """Stop token refresh tasks when leadership is lost"""
+        logger.info("Stopping token refresh tasks")
+        
+        for task_name, task in self.refresh_tasks.items():
+            if not task.done():
+                logger.info(f"Cancelling {task_name} refresh task")
+                task.cancel()
 
-        # Refresh discovered hash every 2 hours
-        next_refresh = 7200 + random.uniform(-300, 300)  # 2 hours ± 5 minutes
-
-        logger.debug(f"Scheduling discovered hash refresh in {next_refresh/3600:.1f} hours")
-
-        self.refresh_tasks['discovered_hash'] = asyncio.create_task(
-                self._delayed_discovered_hash_refresh(next_refresh)
-                )
-
-    async def _delayed_refresh(self, token_type: str, delay: float):
-        """Wait for the specified delay, then refresh the token"""
-        try:
-            await asyncio.sleep(delay)
-            await self._refresh_token(token_type)
-        except Exception as e:
-            logger.error(f"Error in delayed refresh for {token_type}: {str(e)}")
-        finally:
-            # Schedule the next refresh regardless of success/failure
-            self._schedule_refresh(token_type)
-
-    async def _delayed_discovered_hash_refresh(self, delay: float):
-        """Wait for the specified delay, then refresh the discovered hash"""
-        try:
-            await asyncio.sleep(delay)
-            await self._refresh_discovered_hash()
-        except Exception as e:
-            logger.error(f"Error in delayed discovered hash refresh: {str(e)}")
-        finally:
-            # Schedule the next refresh
-            self._schedule_discovered_hash_refresh()
-
-    async def _refresh_token(self, token_type: str) -> bool:
-        """Refresh a specific token type with improved locking and error handling"""
-        # Check if refresh is already in progress to avoid duplicate work
-        if self.refresh_in_progress[token_type]:
-            #logger.debug(f"Refresh for {token_type} already in progress, skipping")
-            return False
-
-        self.refresh_in_progress[token_type] = True
-        success = False
-
-        try:
-            # Increase lock timeout to prevent premature lock expiration during browser automation
-            if await self.redis_cache.acquire_lock(token_type, timeout=120):
-                try:
-                    logger.info(f"Starting {token_type} token refresh")
-                    start_time = time.time()
-
-                    # Double check if another process refreshed the token while we were waiting
-                    if await self._check_token_validity(token_type):
-                        #logger.info(f"Existing {token_type} token is now valid, skipping refresh")
-                        success = True
+    async def _token_refresh_loop(self, token_type):
+        """Background task to refresh a specific token type"""
+        logger.info(f"Starting {token_type} token refresh loop")
+        
+        while self.is_leader:
+            try:
+                # Check if token needs refreshing
+                if await self._check_token_needs_refresh(token_type):
+                    logger.info(f"Refreshing {token_type} token")
+                    
+                    # Track refresh status
+                    self.refresh_in_progress[token_type] = True
+                    
+                    # Acquire lock with a longer timeout for browser operations
+                    if await self.redis_cache.acquire_lock(token_type, timeout=120):
+                        try:
+                            # Double-check after acquiring lock
+                            if await self._check_token_needs_refresh(token_type):
+                                start_time = time.time()
+                                
+                                # Use the appropriate token refresh method
+                                if token_type == 'track':
+                                    success = await self.spotify_api._get_track_token()
+                                else:
+                                    success = await self.spotify_api._get_token(token_type)
+                                    
+                                duration = time.time() - start_time
+                                
+                                if success:
+                                    logger.info(f"{token_type} token refresh succeeded in {duration:.2f}s")
+                                else:
+                                    logger.error(f"{token_type} token refresh failed in {duration:.2f}s")
+                            else:
+                                logger.info(f"{token_type} token was refreshed by another process")
+                        finally:
+                            # Always release the lock
+                            await self.redis_cache.release_lock(token_type)
+                            self.refresh_in_progress[token_type] = False
                     else:
-                        # Call the appropriate token refresh method
-                        if token_type == 'track':
-                            success = await self.spotify_api._get_track_token()
-                        else:
-                            success = await self.spotify_api._get_token(token_type)
+                        logger.info(f"Could not acquire lock for {token_type} token refresh")
+                        self.refresh_in_progress[token_type] = False
+                
+                # Sleep for next refresh interval with jitter
+                jitter = random.uniform(-30, 30)
+                next_refresh = self.refresh_interval + jitter
+                
+                logger.debug(f"Next {token_type} token refresh in {next_refresh:.1f}s")
+                await asyncio.sleep(next_refresh)
+                
+            except asyncio.CancelledError:
+                logger.info(f"{token_type} token refresh loop cancelled")
+                self.refresh_in_progress[token_type] = False
+                break
+            except Exception as e:
+                logger.error(f"Error in {token_type} token refresh loop: {e}")
+                self.refresh_in_progress[token_type] = False
+                await asyncio.sleep(60)  # 1 minute backoff on errors
 
-                        duration = time.time() - start_time
-                        logger.info(f"{token_type} token refresh {'succeeded' if success else 'failed'} in {duration:.2f}s")
-                finally:
-                    # Always release the lock
-                    await self.redis_cache.release_lock(token_type)
-            else:
-                # Instead of warning, log at info level to reduce noise
-                logger.info(f"Could not acquire lock for {token_type} token refresh - another process is refreshing")
-        except Exception as e:
-            logger.error(f"Error during {token_type} token refresh: {str(e)}")
-            # If we hit connection limits, add a delay before retrying
-            if "Too many connections" in str(e):
-                logger.info(f"Waiting 5 seconds due to connection limits")
-                await asyncio.sleep(5)
-        finally:
-            self.refresh_in_progress[token_type] = False
-
-        return success
-
-    async def _refresh_discovered_hash(self) -> bool:
-        """Refresh the discovered-on hash"""
-        try:
-            if await self.redis_cache.acquire_lock('discovered', timeout=60):
-                try:
-                    logger.info("Starting discovered hash refresh")
-
-                    # Check if we already have a valid hash
-                    if await self.redis_cache.get_discovered_hash():
-                        logger.info("Existing discovered hash is still valid, skipping refresh")
-                        return True
-
-                    start_time = time.time()
-                    discovered_hash = await self.spotify_api._get_discovered_hash()
-
-                    if discovered_hash:
-                        await self.redis_cache.save_discovered_hash(discovered_hash)
-                        duration = time.time() - start_time
-                        logger.info(f"Discovered hash refresh succeeded in {duration:.2f}s")
-                        return True
+    async def _discovered_hash_refresh_loop(self):
+        """Background task to refresh the discovered-on hash"""
+        logger.info("Starting discovered hash refresh loop")
+        
+        while self.is_leader:
+            try:
+                # Check if discovered hash exists
+                discovered_hash = await self.redis_cache.get_discovered_hash()
+                
+                if not discovered_hash:
+                    logger.info("Refreshing discovered-on hash")
+                    
+                    if await self.redis_cache.acquire_lock('discovered', timeout=60):
+                        try:
+                            start_time = time.time()
+                            new_hash = await self.spotify_api._get_discovered_hash()
+                            
+                            if new_hash:
+                                await self.redis_cache.save_discovered_hash(new_hash)
+                                duration = time.time() - start_time
+                                logger.info(f"Discovered hash refresh succeeded in {duration:.2f}s")
+                            else:
+                                logger.error("Failed to get discovered hash")
+                        finally:
+                            await self.redis_cache.release_lock('discovered')
                     else:
-                        logger.error("Failed to get discovered hash")
-                        return False
-                finally:
-                    await self.redis_cache.release_lock('discovered')
-            else:
-                logger.warning("Could not acquire lock for discovered hash refresh")
-                return False
-        except Exception as e:
-            logger.error(f"Error during discovered hash refresh: {str(e)}")
-            return False
+                        logger.info("Could not acquire lock for discovered hash refresh")
+                
+                # Sleep for next refresh interval with jitter (12 hours ± 1 hour)
+                jitter = random.uniform(-3600, 3600)
+                next_refresh = self.discovered_hash_refresh_interval + jitter
+                
+                logger.info(f"Next discovered hash refresh in {next_refresh/3600:.1f} hours")
+                await asyncio.sleep(next_refresh)
+                
+            except asyncio.CancelledError:
+                logger.info("Discovered hash refresh loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in discovered hash refresh loop: {e}")
+                await asyncio.sleep(300)  # 5 minute backoff on errors
 
+    async def _check_token_needs_refresh(self, token_type):
+        """Check if a token needs refreshing"""
+        # Check if token exists and is still valid
+        if cached := await self.redis_cache.get_token(token_type):
+            proxy_data = cached['proxy']
+            created_at = proxy_data.get('created_at', 0) if isinstance(proxy_data, dict) else 0
+            age = int(time.time()) - created_at
+            
+            # If token is >50% of its validity, refresh it
+            if age > (self.token_validity * 0.5):
+                logger.info(f"{token_type} token age ({age}s) > 50% of validity ({self.token_validity}s)")
+                return True
+                
+            return False
+        else:
+            # No token, definitely needs refresh
+            logger.info(f"No {token_type} token found, needs refresh")
+            return True
+
+    # Maintain the original method for backward compatibility
     async def _check_token_validity(self, token_type: str) -> bool:
         """
         Check if a token is still valid (not expired)
-        Returns True if token is valid, False if invalid or close to expiry
         """
         if cached := await self.redis_cache.get_token(token_type):
             proxy_data = cached.get('proxy', {})
@@ -217,122 +292,140 @@ class TokenManager:
             age = int(time.time()) - created_at
 
             # Token is valid if it's less than 75% of token_validity seconds old
-            # This ensures we refresh tokens before they expire
             return age < (self.token_validity * 0.75)
 
         return False
 
     async def ensure_token(self, token_type: str) -> bool:
         """
-        Improved token validation with better backoff and retry logic
+        Ensure a token is available for a specific type.
+        This method is called by API endpoints to get a valid token.
         """
-        # First, check if we already have a valid token in memory
-        if self.spotify_api.access_token and self.spotify_api.proxy:
-            # We have a token in memory, still check cache to see if it's recent
-            try:
-                if cached := await self.redis_cache.get_token(token_type):
-                    # Token exists in cache, check if it's still valid
-                    proxy_data = cached.get('proxy', {})
-                    created_at = proxy_data.get('created_at', 0) if isinstance(proxy_data, dict) else 0
-                    age = int(time.time()) - created_at
-
-                    if age < (self.token_validity * 0.75):
-                        # Token is valid and not close to expiry
-                        return True
-
-                    if self.refresh_in_progress[token_type]:
-                        # Token is nearing expiry but a refresh is already in progress
-                        # Use the existing token for now to avoid cascading failures
-                        logger.debug(f"{token_type} token nearing expiry but refresh in progress")
-                        return True
-            except Exception as e:
-                logger.error(f"Error checking token validity: {str(e)}")
-                # Use what we have in memory rather than failing
-                return bool(self.spotify_api.access_token and self.spotify_api.proxy)
-
-        # If we reach here, we need a new token or refresh
-
-        # Use a globally shared refresh trigger flag with expiry
-        global_flag_key = f"refreshing_{token_type}"
-
         try:
-            # Check if a refresh was already triggered in the last 30 seconds
-            if await self.redis_cache.redis.get(global_flag_key):
-                #logger.info(f"{token_type} refresh already triggered by another process")
-                # Use what we have
-                return bool(self.spotify_api.access_token and self.spotify_api.proxy)
-
-            # Set a short-lived flag to prevent multiple processes from triggering refresh
-            await self.redis_cache.redis.set(global_flag_key, "1", ex=30)
-
-            # Only if we got here, we actually trigger the refresh
-            logger.warning(f"No valid {token_type} token, triggering refresh")
-
-            # Start refresh without waiting for it to complete
-            asyncio.create_task(self._refresh_token(token_type))
-
-            # Return what we have - actual refresh will happen in background
-            return bool(self.spotify_api.access_token and self.spotify_api.proxy)
-        except Exception as e:
-            logger.error(f"Error in ensure_token: {str(e)}")
-            # Return what we have
-            return bool(self.spotify_api.access_token and self.spotify_api.proxy)
-
-# Modify SpotifyAPI class to use the TokenManager
-class SpotifyAPIEnhanced(SpotifyAPI):
-    """Enhanced SpotifyAPI class with non-blocking token management"""
-
-    def __init__(self, db_path: str = 'spotify_cache.db'):
-        super().__init__(db_path)
-        self.token_manager = None  # Will be set later
-        self._logger = logging.getLogger(__name__)  # Add logger instance
-
-    @property
-    def logger(self):
-        """Property to access logger"""
-        return self._logger
-
-    def set_token_manager(self, token_manager):
-        """Set the token manager instance"""
-        self.token_manager = token_manager
-
-    async def _ensure_auth(self, token_type: str = 'playlist') -> bool:
-        """
-        Enhanced auth method that uses the token manager instead of
-        blocking for token generation
-        """
-        if not self.token_manager:
-            # Fall back to original implementation if token manager not set
-            return await super()._ensure_auth(token_type)
-
-        # Use token manager's non-blocking check
-        if await self.token_manager.ensure_token(token_type):
-            # Get the token and proxy from cache
-            if cached := await self.cache.get_token(token_type):
-                self.access_token = cached['access_token']
+            # Check if we already have a valid token in memory
+            if self.spotify_api.access_token and self.spotify_api.proxy:
+                # We have a token in memory, still check cache to see if it's recent
+                if cached := await self.redis_cache.get_token(token_type):
+                    # If token exists in cache and is not too old, use it
+                    self.spotify_api.access_token = cached['access_token']
+                    
+                    if 'client_token' in cached:
+                        self.spotify_api.client_token = cached['client_token']
+                        
+                    proxy_data = cached['proxy']
+                    if isinstance(proxy_data, str):
+                        import json
+                        proxy_data = json.loads(proxy_data)
+                    self.spotify_api.proxy = ProxyConfig(**proxy_data)
+                    
+                    return True
+                    
+            # If we don't have a token in memory or our token is outdated, try to get one from Redis
+            if cached := await self.redis_cache.get_token(token_type):
+                self.spotify_api.access_token = cached['access_token']
+                
+                if 'client_token' in cached:
+                    self.spotify_api.client_token = cached['client_token']
+                    
                 proxy_data = cached['proxy']
                 if isinstance(proxy_data, str):
                     import json
                     proxy_data = json.loads(proxy_data)
-                self.proxy = ProxyConfig(**proxy_data)
+                self.spotify_api.proxy = ProxyConfig(**proxy_data)
+                
                 return True
+                
+            # If we're the leader and no token is available, try to refresh immediately
+            if self.is_leader:
+                logger.warning(f"No {token_type} token available, immediate refresh needed")
+                
+                # Trigger immediate refresh
+                if token_type == 'track':
+                    return await self.spotify_api._get_track_token()
+                else:
+                    return await self.spotify_api._get_token(token_type)
+                    
+            # If we're not the leader, we just have to wait for the leader to refresh
+            logger.warning(f"No {token_type} token available and we're not the leader")
+            return False
+                
+        except Exception as e:
+            logger.error(f"Error ensuring token for {token_type}: {e}")
+            return False
 
-        return False
+    # Keep the original method name for backward compatibility
+    async def refresh_token(self, token_type: str = 'playlist') -> bool:
+        """For backward compatibility - now uses the leader-based approach"""
+        # Only try to refresh if we're the leader
+        if self.is_leader and not self.refresh_in_progress.get(token_type, False):
+            logger.info(f"Leader initiating refresh for {token_type} token")
+            
+            # Use the appropriate token refresh method
+            if token_type == 'track':
+                return await self.spotify_api._get_track_token()
+            else:
+                return await self.spotify_api._get_token(token_type)
+        else:
+            # Just check if we have a valid token
+            if cached := await self.redis_cache.get_token(token_type):
+                self.spotify_api.access_token = cached['access_token']
+                
+                if 'client_token' in cached:
+                    self.spotify_api.client_token = cached['client_token']
+                    
+                proxy_data = cached['proxy']
+                if isinstance(proxy_data, str):
+                    import json
+                    proxy_data = json.loads(proxy_data)
+                self.spotify_api.proxy = ProxyConfig(**proxy_data)
+                
+                return True
+                
+            return False
 
-# Enhanced initialization for FastAPI app
+# Enhanced SpotifyAPI class - maintaining original name
+class SpotifyAPIEnhanced(SpotifyAPI):
+    """Enhanced SpotifyAPI class that uses TokenManager"""
+    
+    def __init__(self, db_path: str = 'spotify_cache.db'):
+        super().__init__(db_path)
+        self.token_manager = None  # Will be set later
+        self._logger = logging.getLogger(__name__)
+        
+    @property
+    def logger(self):
+        """Property to access logger"""
+        return self._logger
+        
+    def set_token_manager(self, token_manager):
+        """Set the token manager instance"""
+        self.token_manager = token_manager
+        
+    async def _ensure_auth(self, token_type: str = 'playlist') -> bool:
+        """
+        Enhanced auth method that uses the token manager.
+        """
+        if not self.token_manager:
+            # Fall back to original implementation if token manager not set
+            return await super()._ensure_auth(token_type)
+            
+        # Use token manager to ensure token
+        return await self.token_manager.ensure_token(token_type)
+
+# Setup function - keeping the original signature
 async def setup_token_management(app, spotify_api, redis_cache):
-    """Setup enhanced token management for the app"""
+    """Setup integrated token management for the app"""
     # Create TokenManager
     token_manager = TokenManager(spotify_api, redis_cache)
-
+    
     # If SpotifyAPI is enhanced version, set the token manager
     if hasattr(spotify_api, 'set_token_manager'):
         spotify_api.set_token_manager(token_manager)
-
-    # Initialize on startup
+        
+    # Initialize and start on startup
     @app.on_event("startup")
     async def initialize_token_manager():
         await token_manager.initialize()
-        await token_manager.start_background_refreshing()
-
+        await token_manager.start()
+    
     return token_manager
