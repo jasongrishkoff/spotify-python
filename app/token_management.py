@@ -614,15 +614,69 @@ class SpotifyAPIEnhanced(SpotifyAPI):
         # Use token manager to ensure token
         return await self.token_manager.ensure_token(token_type)
         
-    # Explicitly delegate to parent's _get_token method
     async def _get_token(self, token_type: str = 'playlist') -> bool:
-        """Explicitly delegate to parent class implementation"""
-        return await SpotifyAPI._get_token(self, token_type)
-        
-    # Also explicitly delegate the _get_track_token method
+        """Implement token refresh with improved proxy handling"""
+        try:
+            self.logger.info(f"Getting {token_type} token")
+            
+            # Try multiple proxies if needed
+            for attempt in range(3):
+                # Get a fresh proxy each time
+                self.proxy = None
+                proxy = await self._get_proxy()
+                if not proxy:
+                    self.logger.error(f"Failed to get proxy (attempt {attempt+1})")
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                    
+                self.proxy = proxy
+                
+                # More browser-like settings
+                try:
+                    access_token, client_token, operation_hashes = await self.capture_tokens_and_hashes(
+                        self.proxy, 
+                        use_stealth=True
+                    )
+                    
+                    if access_token:
+                        # Save token
+                        self.access_token = access_token
+                        if client_token:
+                            self.client_token = client_token
+                            
+                        # Use token_manager's redis_cache
+                        if hasattr(self, 'token_manager') and self.token_manager:
+                            await self.token_manager.redis_cache.save_token(
+                                access_token, 
+                                self.proxy.__dict__, 
+                                token_type=token_type, 
+                                client_token=client_token
+                            )
+                            
+                            # Update hash manager
+                            if operation_hashes and hasattr(self, 'hash_manager'):
+                                await self.hash_manager.update_hashes(operation_hashes)
+                                
+                            self.logger.info(f"Successfully refreshed {token_type} token")
+                            return True
+                        else:
+                            self.logger.error("No token_manager available")
+                            return False
+                except Exception as e:
+                    self.logger.warning(f"Error in attempt {attempt+1}: {e}")
+                    await asyncio.sleep(3)
+                    
+            self.logger.error(f"Failed to get {token_type} token after multiple attempts")
+            return False
+        except Exception as e:
+            self.logger.error(f"Error in _get_token for {token_type}: {e}")
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            return False
+
     async def _get_track_token(self) -> bool:
-        """Explicitly delegate to parent class implementation"""
-        return await SpotifyAPI._get_track_token(self)
+        """Implement track token refresh directly"""
+        return await self._get_token('track')
 
 # Setup function - keeping the original signature
 async def setup_token_management(app, spotify_api, redis_cache):

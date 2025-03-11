@@ -504,7 +504,7 @@ class SpotifyAPI:
             logger.warning(f"Proxy validation error: {e}")
             return False
 
-    async def capture_tokens_and_hashes(self, proxy=None) -> Tuple[Optional[str], Optional[str], Dict[str, str]]:
+    async def capture_tokens_and_hashes(self, proxy=None, use_stealth=False) -> Tuple[Optional[str], Optional[str], Dict[str, str]]:
         """
         Extract Spotify tokens and GraphQL operation hashes by monitoring network requests
         
@@ -525,25 +525,40 @@ class SpotifyAPI:
             'getTrack', 
             'queryArtistDiscoveredOn'
         }
-        
+
         try:
-            self.logger.info(f"Starting token and hash capture with proxy: {proxy}")
+            self.logger.info(f"Starting token capture with stealth={use_stealth}")
             async with async_playwright() as p:
                 browser_args = [
                     '--no-sandbox',
                     '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--disable-features=IsolateOrigins,site-per-process',  # Add this
-                    '--disable-web-security',  # Add this
-                    '--disable-blink-features=AutomationControlled'  # Add this
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-extensions',
+                    '--disable-features=IsolateOrigins,site-per-process',
+                    '--disable-site-isolation-trials'
                 ]
+                
+                # Add stealth mode args
+                if use_stealth:
+                    browser_args.extend([
+                        '--disable-web-security',
+                        '--disable-features=IsolateOrigins',
+                        '--disable-site-isolation-trials',
+                        '--disable-setuid-sandbox',
+                        '--no-default-browser-check',
+                        '--no-first-run',
+                        '--no-zygote',
+                        '--disable-accelerated-2d-canvas',
+                        '--disable-accelerated-video-decode',
+                        '--disable-gpu'
+                    ])
                 
                 browser = await p.chromium.launch(
                     proxy=proxy.to_playwright_config() if proxy else None,
                     headless=True,
                     args=browser_args
                 )
-                
+
                 try:
                     # Create a context with a credible user agent
                     context = await browser.new_context(
