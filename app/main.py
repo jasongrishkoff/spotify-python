@@ -35,6 +35,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def limit_requests_on_token_failure(request: Request, call_next):
+    """Prevent request floods during token failures"""
+    # Skip health endpoint and warm-up check
+    if request.url.path.startswith("/health"):
+        return await call_next(request)
+
+    # Check circuit breaker status
+    if hasattr(spotify_api, 'circuit_breaker'):
+        try:
+            if not await spotify_api.circuit_breaker.can_execute():
+                return Response(
+                    content=json.dumps({
+                        "detail": "Service temporarily unavailable due to authentication issues. Please try again later."
+                    }),
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    media_type="application/json"
+                )
+        except Exception as e:
+            logger.error(f"Error checking circuit breaker: {e}")
+
+    # Continue with the request
+    return await call_next(request)
+
 # We'll set up the token manager during startup
 @app.on_event("startup")
 async def startup_event():

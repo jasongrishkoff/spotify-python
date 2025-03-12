@@ -14,6 +14,102 @@ from .cache import RedisCache
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+class ProxyPool:
+    def __init__(self, max_size=5):
+        self.proxies = []
+        self.max_size = max_size
+        self._lock = asyncio.Lock()
+        self.last_fetch_time = 0
+        self.fetch_cooldown = 5  # Seconds between proxy fetch attempts
+        self.logger = logging.getLogger(__name__)
+
+    async def get_proxy(self, session=None):
+        async with self._lock:
+            # Try to use existing proxies first
+            working_proxies = [p for p in self.proxies if time.time() - p.created_at < 1800]
+
+            if working_proxies:
+                return random.choice(working_proxies)
+
+            # Rate limit proxy fetching
+            current_time = time.time()
+            if current_time - self.last_fetch_time < self.fetch_cooldown:
+                await asyncio.sleep(self.fetch_cooldown - (current_time - self.last_fetch_time))
+
+            self.last_fetch_time = time.time()
+
+            # If no working proxies, get a new one
+            new_proxy = await self._fetch_new_proxy(session)
+            if new_proxy:
+                self.proxies.append(new_proxy)
+
+                # Maintain max pool size
+                if len(self.proxies) > self.max_size:
+                    self.proxies.pop(0)
+
+                return new_proxy
+
+            # If we still have old proxies, better to use those than nothing
+            if self.proxies:
+                self.logger.warning("Using expired proxy as fallback")
+                return self.proxies[-1]
+
+            return None
+
+    async def _fetch_new_proxy(self, session=None):
+        # Add jitter to prevent hammering proxy service
+        await asyncio.sleep(random.uniform(0.1, 1.0))
+
+        needs_close = False
+        if not session:
+            needs_close = True
+            session = aiohttp.ClientSession()
+
+        try:
+            async with session.get('https://api.submithub.com/api/proxy', timeout=15) as response:
+                if response.status == 200:
+                    proxy_data = await response.json()
+                    proxy = ProxyConfig.from_response(proxy_data)
+                    proxy.created_at = int(time.time())
+
+                    # Test the proxy
+                    if await self._test_proxy(proxy, session):
+                        self.logger.info(f"New proxy acquired and validated: {proxy}")
+                        return proxy
+                    else:
+                        self.logger.warning(f"New proxy failed validation: {proxy}")
+                        return None
+                else:
+                    self.logger.error(f"Failed to get proxy, status: {response.status}")
+                    return None
+        except Exception as e:
+            self.logger.error(f"Error fetching proxy: {e}")
+            return None
+        finally:
+            if needs_close:
+                await session.close()
+
+    async def _test_proxy(self, proxy, session=None):
+        needs_close = False
+        if not session:
+            needs_close = True
+            session = aiohttp.ClientSession()
+
+        try:
+            test_url = "https://httpbin.org/ip"
+            async with session.get(
+                test_url,
+                proxy=proxy.url,
+                proxy_auth=proxy.auth,
+                timeout=5
+            ) as response:
+                return response.status == 200
+        except Exception:
+            return False
+        finally:
+            if needs_close and session:
+                await session.close()
+
 @dataclass
 class ProxyConfig:
     address: str
@@ -225,6 +321,40 @@ class DiscoveredHashCircuitBreaker:
         """Record a successful request"""
         self.consecutive_failures = 0
 
+class TokenCircuitBreaker:
+    def __init__(self, failure_threshold=10, cooldown_period=60):
+        self.failure_count = 0
+        self.failure_threshold = failure_threshold
+        self.cooldown_period = cooldown_period
+        self.is_open = False
+        self.last_failure_time = 0
+        self._lock = asyncio.Lock()
+        self.logger = logging.getLogger(__name__)
+        
+    async def record_failure(self):
+        async with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            
+            if self.failure_count >= self.failure_threshold and not self.is_open:
+                self.is_open = True
+                self.logger.warning(f"Circuit breaker opened - cooling off for {self.cooldown_period}s")
+    
+    async def can_execute(self):
+        async with self._lock:
+            # Reset if cooldown period has passed
+            if self.is_open and time.time() - self.last_failure_time > self.cooldown_period:
+                self.is_open = False
+                self.failure_count = 0
+                self.logger.info("Circuit breaker reset after cooldown")
+                
+            return not self.is_open
+    
+    async def record_success(self):
+        async with self._lock:
+            if self.failure_count > 0:
+                self.failure_count = max(0, self.failure_count - 1)
+
 class SpotifyAPI:
     MAX_RETRIES = 3
 
@@ -239,6 +369,8 @@ class SpotifyAPI:
         self.cache = RedisCache()
         self.discovered_hash_circuit_breaker = DiscoveredHashCircuitBreaker()
         self.hash_manager = GraphQLHashManager(self.cache)
+        self.circuit_breaker = TokenCircuitBreaker(failure_threshold=5, cooldown_period=30)
+        self.proxy_pool = ProxyPool()
 
     async def _ensure_initialized(self):
         if self._init_task is None:
@@ -261,41 +393,12 @@ class SpotifyAPI:
                 logger.error(f"Error closing session: {e}")
 
     async def _get_proxy(self) -> Optional[ProxyConfig]:
-        if self.proxy and time.time() - self.proxy.created_at < 1800:  # 30-minute reuse
+        """Get a proxy from the proxy pool"""
+        if self.proxy and time.time() - self.proxy.created_at < 1800:
             return self.proxy
-
-        try:
-            if not self.session:
-                self.session = aiohttp.ClientSession()
-
-            async with self.session.get('https://api.submithub.com/api/proxy', timeout=15) as response:
-                if response.status == 200:
-                    proxy_data = await response.json()
-                    # Test the proxy before returning it
-                    proxy = ProxyConfig.from_response(proxy_data)
-                    
-                    # Verify proxy works with a simple connection test
-                    test_url = "https://httpbin.org/ip"
-                    try:
-                        async with self.session.get(
-                            test_url,
-                            proxy=proxy.url,
-                            proxy_auth=proxy.auth,
-                            timeout=5
-                        ) as test_response:
-                            if test_response.status == 200:
-                                logger.info(f"Proxy test successful: {proxy}")
-                                self.proxy = proxy
-                                return proxy
-                            else:
-                                logger.error(f"Proxy test failed with status: {test_response.status}")
-                    except Exception as e:
-                        logger.error(f"Proxy test connection error: {e}")
-                        return None
-                logger.error(f"Failed to get proxy, status: {response.status}")
-        except Exception as e:
-            logger.error(f"Proxy error: {e}")
-        return None
+            
+        self.proxy = await self.proxy_pool.get_proxy(self.session)
+        return self.proxy
 
     @asynccontextmanager
     async def _browser_session(self, retry_count: int = 0):
@@ -364,13 +467,14 @@ class SpotifyAPI:
                 logger.error(f"Error during browser cleanup: {str(e)}")
 
     async def _ensure_auth(self, token_type: str = 'playlist') -> bool:
-        """
-        Check if we have a valid token, and if not, try to refresh it.
-        This is a modified version that's more efficient and resilient.
-        """
+        """Ensure we have a valid token with proper backoff and circuit breaking"""
+        # Check circuit breaker first
+        if not await self.circuit_breaker.can_execute():
+            logger.warning(f"Circuit breaker open, skipping {token_type} token fetch")
+            return False
+            
         # Quick check if we already have a valid token
         if self.access_token and self.proxy:
-            # Verify the proxy is still valid with lightweight test
             if await self._verify_proxy():
                 return True
             else:
@@ -380,100 +484,56 @@ class SpotifyAPI:
                 self.client_token = None
                 self.proxy = None
 
-        # Check cache first
-        if cached := await self.cache.get_token(token_type):
-            cached_time = cached['proxy'].get('created_at', 0)
-            current_time = int(time.time())
-
-            if current_time - cached_time < 480:  # 8 minutes
-                self.access_token = cached['access_token']
-                
-                # Also get client token if available
-                if 'client_token' in cached:
-                    self.client_token = cached['client_token']
-
-                # Handle proxy data format (might be string or dict)
-                proxy_data = cached['proxy']
-                if isinstance(proxy_data, str):
-                    import json
-                    proxy_data = json.loads(proxy_data)
-
-                self.proxy = ProxyConfig(**proxy_data)
-                
-                # Verify the proxy is still valid
-                if await self._verify_proxy():
-                    return True
-                else:
-                    # Proxy is invalid, clear token from cache
-                    logger.warning(f"Proxy validation failed for cached {token_type} token, forcing refresh")
-                    await self.cache.clear_token(token_type)
-                    self.access_token = None
-                    self.client_token = None
-                    self.proxy = None
-
-        # Use exponential backoff for waiting
-        max_attempts = 3  # Reduced from 5 to minimize blocking
-        for attempt in range(max_attempts):
-            # Try to acquire lock with shorter timeout
-            if await self.cache.acquire_lock(token_type, timeout=10):
+        # Check cache with progressive backoff
+        max_retries = 3
+        for attempt in range(max_retries):
+            # Try from cache first
+            if cached := await self.cache.get_token(token_type):
                 try:
-                    # Double-check if another process refreshed the token while we were waiting
-                    if cached := await self.cache.get_token(token_type):
-                        self.access_token = cached['access_token']
-                        
-                        # Also get client token if available
-                        if 'client_token' in cached:
-                            self.client_token = cached['client_token']
-                            
-                        proxy_data = cached['proxy']
-                        if isinstance(proxy_data, str):
-                            import json
-                            proxy_data = json.loads(proxy_data)
-                        self.proxy = ProxyConfig(**proxy_data)
-                        
-                        # Verify the proxy is still valid
-                        if await self._verify_proxy():
+                    self.access_token = cached['access_token']
+                    if 'client_token' in cached:
+                        self.client_token = cached['client_token']
+                    
+                    proxy_data = cached['proxy']
+                    if isinstance(proxy_data, str):
+                        proxy_data = json.loads(proxy_data)
+                    
+                    self.proxy = ProxyConfig(**proxy_data)
+                    
+                    if await self._verify_proxy():
+                        await self.circuit_breaker.record_success()
+                        return True
+                except Exception as e:
+                    logger.error(f"Error loading cached token: {e}")
+                    
+            # Try to get a new token with lock
+            try:
+                # Only try to get lock on first attempt to prevent deadlock
+                if attempt == 0 and await self.cache.acquire_lock(token_type, timeout=10):
+                    try:
+                        success = await self._get_token(token_type)
+                        if success:
+                            await self.circuit_breaker.record_success()
                             return True
                         else:
-                            # Proxy is invalid, clear it and continue to refresh
-                            logger.warning(f"Proxy validation failed for cached {token_type} token, continuing to refresh")
-                            self.access_token = None
-                            self.client_token = None
-                            self.proxy = None
-
-                    # Get a new token
-                    success = await self._get_token(token_type)
-
-                    if success:
-                        return True
-
-                    logger.error(f"Token refresh failed for {token_type}")
-                finally:
-                    await self.cache.release_lock(token_type)
-
-            # Exponential backoff wait with reduced times
-            wait_time = min(2 ** attempt, 4)  # Max 4 second wait (reduced from 8)
-            await asyncio.sleep(wait_time)
-
-            # Check if another process refreshed the token while we were waiting
-            if cached := await self.cache.get_token(token_type):
-                self.access_token = cached['access_token']
-                
-                # Also get client token if available
-                if 'client_token' in cached:
-                    self.client_token = cached['client_token']
-                    
-                proxy_data = cached['proxy']
-                if isinstance(proxy_data, str):
-                    import json
-                    proxy_data = json.loads(proxy_data)
-                self.proxy = ProxyConfig(**proxy_data)
-                
-                # Verify the proxy is still valid
-                if await self._verify_proxy():
-                    return True
-
-        # If we get here, we couldn't get a token
+                            await self.circuit_breaker.record_failure()
+                    finally:
+                        await self.cache.release_lock(token_type)
+                elif attempt > 0:
+                    # On retry, check if another process got token while we waited
+                    await asyncio.sleep(1)
+                    continue
+            except Exception as e:
+                logger.error(f"Error getting token: {e}")
+                await self.circuit_breaker.record_failure()
+            
+            # Exponential backoff with jitter
+            backoff_time = min(30, (2 ** attempt) * (0.5 + random.random()))
+            logger.info(f"Token fetch failed, backing off for {backoff_time:.2f}s")
+            await asyncio.sleep(backoff_time)
+        
+        # All attempts failed
+        await self.circuit_breaker.record_failure()
         return False
 
     async def _verify_proxy(self) -> bool:
