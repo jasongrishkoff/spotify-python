@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import aiohttp
 import time
 import random
 import os
@@ -129,6 +130,29 @@ class TokenManager:
                             await self.spotify_api._get_token(token_type)
             except Exception as e:
                 logger.error(f"Error refreshing {token_type} token on startup: {e}")
+
+    async def wait_for_tokens(self):
+        """For non-leader workers: wait for tokens to become available"""
+        logger.info("Non-leader worker waiting for tokens...")
+        
+        max_wait_time = 90  # 1.5 minutes max wait
+        check_interval = 5   # Check every 5 seconds
+        
+        start_time = time.time()
+        while time.time() - start_time < max_wait_time:
+            all_tokens_available = True
+            for token_type in self.token_types:
+                if not await self.redis_cache.get_token(token_type):
+                    all_tokens_available = False
+                    break
+                    
+            if all_tokens_available:
+                logger.info("All required tokens are available")
+                return
+                
+            await asyncio.sleep(check_interval)
+        
+        logger.warning("Maximum wait time for tokens reached")
 
     async def start_background_refreshing(self):
         """
@@ -765,7 +789,7 @@ async def setup_token_management(app, spotify_api, redis_cache):
     async def initialize_token_manager():
         await token_manager.initialize()
         
-        # Try to become the leader immediately on startup
+        # Try to become the leader immediately
         leader_result = await redis_cache.redis.set(
             token_manager.leader_key,
             token_manager.instance_id,
@@ -776,11 +800,13 @@ async def setup_token_management(app, spotify_api, redis_cache):
         if leader_result:
             logger.info(f"Instance {token_manager.instance_id} claimed initial leadership")
             token_manager.is_leader = True
+            
+            # Only the leader performs token refresh
+            await token_manager.force_token_refresh_on_startup()
+        else:
+            logger.info(f"Instance {token_manager.instance_id} is not initial leader, skipping token refresh")
         
-        # Force token validation and refresh on startup
-        await token_manager.force_token_refresh_on_startup()
-        
-        # Start the token manager
+        # Start the token manager for all instances
         await token_manager.start()
 
     return token_manager

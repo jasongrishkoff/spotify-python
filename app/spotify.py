@@ -1463,9 +1463,10 @@ class SpotifyAPI:
         try:
             if not self.proxy:
                 self.proxy = await self._get_proxy()
-            if not self.proxy:
-                logger.error("Failed to get proxy")
-                return None
+                if not self.proxy:
+                    logger.warning("Failed to get proxy for hash refresh - using cached hash if available")
+                    # Try to use existing hash
+                    return await self.hash_manager.get_hash('queryArtistDiscoveredOn')
 
             # Use a separate variable for the browser to avoid context issues
             discovered_hash = None
@@ -1941,9 +1942,11 @@ class SpotifyAPI:
                 }
 
         #logger.info(f"Formatted track data: {formatted_data}")
-
         if not formatted_data.get('id'):
-            logger.error("No track ID in formatted data")
-            return None
+            logger.warning(f"Track missing ID: {track.get('name', 'Unknown')}")
+            # Try alternate ID sources
+            if track.get('uri'):
+                formatted_data['id'] = track['uri'].split(':')[-1]
+                logger.info(f"Used URI as fallback ID: {formatted_data['id']}")
 
         return formatted_data

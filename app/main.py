@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Response, status
+import time
 from pydantic import BaseModel, Field
 import random
 import json
@@ -48,16 +49,61 @@ async def startup_event():
     asyncio.create_task(mark_app_ready())
 
 async def mark_app_ready():
-    """Wait for tokens to refresh before marking the app as ready"""
+    """Wait for tokens to be available before marking app ready"""
     global app_ready
-
-    # Wait for initial token refresh (typically takes 60-90 seconds)
-    wait_time = 120  # 2 minutes
-    logger.info(f"Entering warm-up phase for {wait_time} seconds")
-    await asyncio.sleep(wait_time)
-
+    
+    # Check if tokens already exist in Redis
+    logger.info("Checking if valid tokens already exist")
+    
+    token_types = ['playlist', 'artist', 'track']
+    all_tokens_valid = True
+    
+    for token_type in token_types:
+        if cached := await redis_cache.get_token(token_type):
+            proxy_data = cached['proxy']
+            if isinstance(proxy_data, str):
+                import json
+                proxy_data = json.loads(proxy_data)
+            
+            # If token is less than 10 minutes old, consider it valid
+            created_at = proxy_data.get('created_at', 0)
+            age = int(time.time()) - created_at
+            if age < 600:
+                logger.info(f"Found valid {token_type} token (age: {age}s)")
+                continue
+        
+        all_tokens_valid = False
+        break
+    
+    if all_tokens_valid:
+        logger.info("All tokens are valid, skipping warm-up")
+        app_ready = True
+        return
+    
+    # Otherwise wait for tokens with polling
+    max_wait = 120
+    check_interval = 5
+    start_time = time.time()
+    
+    logger.info(f"Entering warm-up phase for up to {max_wait} seconds")
+    
+    while time.time() - start_time < max_wait:
+        all_tokens_present = True
+        for token_type in token_types:
+            if not await redis_cache.get_token(token_type):
+                all_tokens_present = False
+                break
+        
+        if all_tokens_present:
+            logger.info(f"All tokens available after {int(time.time() - start_time)}s, ending warm-up")
+            app_ready = True
+            return
+        
+        await asyncio.sleep(check_interval)
+    
+    # Fallback to timeout
     app_ready = True
-    logger.info("Warm-up complete, app is now ready to serve requests")
+    logger.info("Warm-up complete (timeout reached)")
 
 # Add middleware to check app readiness
 @app.middleware("http")
