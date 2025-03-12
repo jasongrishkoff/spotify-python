@@ -680,30 +680,76 @@ class SpotifyAPIEnhanced(SpotifyAPI):
         return self._logger
         
     async def _ensure_auth(self, token_type: str = 'playlist') -> bool:
-        """
-        Simplified auth method that only reads from Redis
-        """
-        try:
-            # Get token from Redis
-            if cached := await self.cache.get_token(token_type):
-                self.access_token = cached['access_token']
-                
-                if 'client_token' in cached:
-                    self.client_token = cached['client_token']
-                    
-                proxy_data = cached['proxy']
-                if isinstance(proxy_data, str):
-                    import json
-                    proxy_data = json.loads(proxy_data)
-                
-                self.proxy = ProxyConfig(**proxy_data)
-                return True
+        """Ensure we have a valid token with proper backoff and circuit breaking"""
+        # Check circuit breaker first
+        if not await self.circuit_breaker.can_execute():
+            logger.warning(f"Circuit breaker open, skipping {token_type} token fetch")
+            return False
             
-            return False
-        except Exception as e:
-            self.logger.error(f"Error ensuring token from Redis: {e}")
-            return False
-    
+        # Quick check if we already have a valid token
+        if self.access_token and self.proxy:
+            if await self._verify_proxy():
+                return True
+            else:
+                # Proxy is invalid, clear it
+                logger.warning("Proxy validation failed, clearing token and proxy")
+                self.access_token = None
+                self.client_token = None
+                self.proxy = None
+
+        # Check cache with progressive backoff
+        max_retries = 3
+        for attempt in range(max_retries):
+            # Try from cache first
+            if cached := await self.cache.get_token(token_type):
+                try:
+                    self.access_token = cached['access_token']
+                    if 'client_token' in cached:
+                        self.client_token = cached['client_token']
+                    
+                    proxy_data = cached['proxy']
+                    if isinstance(proxy_data, str):
+                        proxy_data = json.loads(proxy_data)
+                    
+                    self.proxy = ProxyConfig(**proxy_data)
+                    
+                    if await self._verify_proxy():
+                        await self.circuit_breaker.record_success()
+                        return True
+                except Exception as e:
+                    logger.error(f"Error loading cached token: {e}")
+                    
+            # Try to get a new token with lock
+            try:
+                # Only try to get lock on first attempt to prevent deadlock
+                if attempt == 0 and await self.cache.acquire_lock(token_type, timeout=10):
+                    try:
+                        success = await self._get_token(token_type)
+                        if success:
+                            await self.circuit_breaker.record_success()
+                            return True
+                        else:
+                            await self.circuit_breaker.record_failure()
+                    finally:
+                        await self.cache.release_lock(token_type)
+                elif attempt > 0:
+                    # On retry, check if another process got token while we waited
+                    await asyncio.sleep(1)
+                    # Continue to next iteration of the for loop
+                    continue
+            except Exception as e:
+                logger.error(f"Error getting token: {e}")
+                await self.circuit_breaker.record_failure()
+            
+            # Exponential backoff with jitter
+            backoff_time = min(30, (2 ** attempt) * (0.5 + random.random()))
+            logger.info(f"Token fetch failed, backing off for {backoff_time:.2f}s")
+            await asyncio.sleep(backoff_time)
+        
+        # All attempts failed
+        await self.circuit_breaker.record_failure()
+        return False
+
     # Remove or replace these with stub methods:
     async def _get_token(self, token_type: str = 'playlist') -> bool:
         """No longer fetches tokens - tokens come from token_worker"""
