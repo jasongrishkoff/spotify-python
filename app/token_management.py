@@ -686,21 +686,20 @@ class SpotifyAPIEnhanced(SpotifyAPI):
             logger.warning(f"Circuit breaker open, skipping {token_type} token fetch")
             return False
             
-        # Quick check if we already have a valid token
-        if self.access_token and self.proxy:
-            if await self._verify_proxy():
-                return True
-            else:
-                # Proxy is invalid, clear it
-                logger.warning("Proxy validation failed, clearing token and proxy")
-                self.access_token = None
-                self.client_token = None
-                self.proxy = None
+        # Try up to 3 times to get a valid token+proxy combo
+        for attempt in range(3):
+            # Check if current token+proxy are valid
+            if self.access_token and self.proxy:
+                if await self._verify_proxy():
+                    return True
+                else:
+                    # Proxy is invalid, clear it
+                    logger.warning("Proxy validation failed, clearing token and proxy")
+                    self.access_token = None
+                    self.client_token = None
+                    self.proxy = None
 
-        # Check cache with progressive backoff
-        max_retries = 3
-        for attempt in range(max_retries):
-            # Try from cache first
+            # Try to get a fresh token+proxy from Redis
             if cached := await self.cache.get_token(token_type):
                 try:
                     self.access_token = cached['access_token']
@@ -713,38 +712,26 @@ class SpotifyAPIEnhanced(SpotifyAPI):
                     
                     self.proxy = ProxyConfig(**proxy_data)
                     
+                    # Verify this proxy actually works
                     if await self._verify_proxy():
                         await self.circuit_breaker.record_success()
                         return True
+                    else:
+                        # If it fails, try another token if available
+                        self.access_token = None
+                        self.client_token = None
+                        self.proxy = None
+                        
+                        # Small backoff before retry
+                        await asyncio.sleep(0.5 * (attempt + 1))
                 except Exception as e:
                     logger.error(f"Error loading cached token: {e}")
-                    
-            # Try to get a new token with lock
-            try:
-                # Only try to get lock on first attempt to prevent deadlock
-                if attempt == 0 and await self.cache.acquire_lock(token_type, timeout=10):
-                    try:
-                        success = await self._get_token(token_type)
-                        if success:
-                            await self.circuit_breaker.record_success()
-                            return True
-                        else:
-                            await self.circuit_breaker.record_failure()
-                    finally:
-                        await self.cache.release_lock(token_type)
-                elif attempt > 0:
-                    # On retry, check if another process got token while we waited
-                    await asyncio.sleep(1)
-                    # Continue to next iteration of the for loop
-                    continue
-            except Exception as e:
-                logger.error(f"Error getting token: {e}")
-                await self.circuit_breaker.record_failure()
             
-            # Exponential backoff with jitter
-            backoff_time = min(30, (2 ** attempt) * (0.5 + random.random()))
-            logger.info(f"Token fetch failed, backing off for {backoff_time:.2f}s")
-            await asyncio.sleep(backoff_time)
+            # If we're still here, we couldn't get a valid token+proxy
+            logger.warning(f"No valid token+proxy available on attempt {attempt+1}")
+            
+            # Backoff before next attempt
+            await asyncio.sleep(1 * (attempt + 1))
         
         # All attempts failed
         await self.circuit_breaker.record_failure()

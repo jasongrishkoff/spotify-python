@@ -371,6 +371,8 @@ class SpotifyAPI:
         self.hash_manager = GraphQLHashManager(self.cache)
         self.circuit_breaker = TokenCircuitBreaker(failure_threshold=5, cooldown_period=30)
         self.proxy_pool = ProxyPool()
+        self._proxy_validation_cache = {}  # Store validation timestamps
+        self._proxy_validation_ttl = 300   # Validate every 5 minutes (adjust as needed)
 
     async def _ensure_initialized(self):
         if self._init_task is None:
@@ -479,7 +481,7 @@ class SpotifyAPI:
                 return True
             else:
                 # Proxy is invalid, clear it
-                logger.warning("Proxy validation failed, clearing token and proxy")
+                logger.debug("Proxy validation failed, clearing token and proxy")
                 self.access_token = None
                 self.client_token = None
                 self.proxy = None
@@ -538,11 +540,22 @@ class SpotifyAPI:
 
     async def _verify_proxy(self) -> bool:
         """
-        Verify that the current proxy is still valid with a lightweight test.
+        Verify that the current proxy is still valid, with caching to reduce overhead.
         """
         if not self.proxy:
             return False
             
+        proxy_id = f"{self.proxy.address}:{self.proxy.port}"
+        current_time = time.time()
+        
+        # If we have a recent validation result, use it
+        if proxy_id in self._proxy_validation_cache:
+            last_validation, is_valid = self._proxy_validation_cache[proxy_id]
+            # If validated within TTL, return cached result
+            if current_time - last_validation < self._proxy_validation_ttl:
+                return is_valid
+        
+        # Need to actually validate the proxy
         if not self.session:
             self.session = aiohttp.ClientSession()
             
@@ -553,14 +566,20 @@ class SpotifyAPI:
                 test_url,
                 proxy=self.proxy.url,
                 proxy_auth=self.proxy.auth,
-                timeout=3  # Very short timeout for quick validation
+                timeout=5  # Increased timeout
             ) as test_response:
-                if test_response.status == 200:
-                    return True
-                else:
+                is_valid = test_response.status == 200
+                
+                # Cache the result
+                self._proxy_validation_cache[proxy_id] = (current_time, is_valid)
+                
+                if not is_valid:
                     logger.warning(f"Proxy validation failed with status: {test_response.status}")
-                    return False
+                
+                return is_valid
         except Exception as e:
+            # Cache the failure
+            self._proxy_validation_cache[proxy_id] = (current_time, False)
             logger.warning(f"Proxy validation error: {e}")
             return False
 
@@ -935,73 +954,43 @@ class SpotifyAPI:
         try:
             await self.rate_limiter.acquire()
 
-            if not await self._ensure_auth():
-                self.logger.error("Failed to get auth token")
-                return None
-
-            if not self.session:
-                self.session = aiohttp.ClientSession()
-
-            if not self.proxy:
-                self.logger.error("No proxy available")
-                return None
-
-            # REST API for playlists
-            url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
+            # Make sure we have valid auth
+            retry_count = 0
+            max_retries = 2
             
-            if with_tracks:
-                fields = "id,name,description,owner(id,display_name),followers(total),images,collaborative,tracks(total,items(added_at,track(id,name,duration_ms,preview_url,artists(id,name),album(images,name))))"
-            else:
-                fields = "id,name,description,owner(id,display_name),followers(total),images,tracks(total),collaborative"
+            while retry_count <= max_retries:
+                if not await self._ensure_auth():
+                    self.logger.error("Failed to get auth token")
+                    return None
 
-            params = {'fields': fields}
+                if not self.session:
+                    self.session = aiohttp.ClientSession()
 
-            headers = {'Authorization': f'Bearer {self.access_token}'}
-            if hasattr(self, 'client_token') and self.client_token:
-                headers['client-token'] = self.client_token
+                if not self.proxy:
+                    self.logger.error("No proxy available")
+                    if retry_count < max_retries:
+                        retry_count += 1
+                        await asyncio.sleep(1)
+                        continue
+                    return None
+
+                # REST API for playlists
+                url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
                 
-            async with self.session.get(
-                    url,
-                    params=params,
-                    headers=headers,
-                    proxy=self.proxy.url,
-                    proxy_auth=self.proxy.auth,
-                    timeout=10
-                    ) as response:
-                if response.status == 200:
-                    playlist_data = await response.json()
-                elif response.status in {401, 407}:
-                    self.access_token = None
-                    self.client_token = None
-                    self.proxy = None
-                    logger.warning(f"Failed to fetch playlist {playlist_id}: {response.status}")
-                    return None
+                if with_tracks:
+                    fields = "id,name,description,owner(id,display_name),followers(total),images,collaborative,tracks(total,items(added_at,track(id,name,duration_ms,preview_url,artists(id,name),album(images,name))))"
                 else:
-                    logger.warning(f"Failed to fetch playlist {playlist_id}: {response.status}")
-                    return None
+                    fields = "id,name,description,owner(id,display_name),followers(total),images,tracks(total),collaborative"
 
-            # If tracks are requested, fetch them with pagination
-            if with_tracks:
-                all_tracks = []
-                # Calculate how many tracks to fetch (200)
-                total_tracks = min(playlist_data.get('tracks', {}).get('total', 0), 200)
-                offset = 0
-                limit = 100  # Spotify's max limit per request
+                params = {'fields': fields}
 
-                while offset < total_tracks:
-                    tracks_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
-                    params = {
-                            'offset': offset,
-                            'limit': limit,
-                            'fields': 'items(added_at,track(id,artists(id,name),name,preview_url,duration_ms,album(images,name)))'
-                            }
-
-                    headers = {'Authorization': f'Bearer {self.access_token}'}
-                    if hasattr(self, 'client_token') and self.client_token:
-                        headers['client-token'] = self.client_token
-
+                headers = {'Authorization': f'Bearer {self.access_token}'}
+                if hasattr(self, 'client_token') and self.client_token:
+                    headers['client-token'] = self.client_token
+                    
+                try:
                     async with self.session.get(
-                            tracks_url,
+                            url,
                             params=params,
                             headers=headers,
                             proxy=self.proxy.url,
@@ -1009,21 +998,90 @@ class SpotifyAPI:
                             timeout=10
                             ) as response:
                         if response.status == 200:
-                            tracks_data = await response.json()
-                            all_tracks.extend(tracks_data.get('items', []))
+                            playlist_data = await response.json()
+                        elif response.status in {401, 407}:
+                            self.access_token = None
+                            self.client_token = None
+                            self.proxy = None
+                            logger.warning(f"Failed to fetch playlist {playlist_id}: {response.status}")
+                            if retry_count < max_retries:
+                                retry_count += 1
+                                await asyncio.sleep(1)
+                                continue
+                            return None
                         else:
-                            logger.warning(f"Failed to fetch tracks at offset {offset}: {response.status}")
-                            break
+                            logger.warning(f"Failed to fetch playlist {playlist_id}: {response.status}")
+                            if retry_count < max_retries:
+                                retry_count += 1
+                                await asyncio.sleep(1)
+                                continue
+                            return None
 
-                    offset += limit
+                    # If tracks are requested, fetch them with pagination
+                    if with_tracks:
+                        all_tracks = []
+                        # Calculate how many tracks to fetch (200)
+                        total_tracks = min(playlist_data.get('tracks', {}).get('total', 0), 200)
+                        offset = 0
+                        limit = 100  # Spotify's max limit per request
 
-                # Update the playlist data with all fetched tracks
-                playlist_data['tracks']['items'] = all_tracks
+                        while offset < total_tracks:
+                            # Check if proxy is still valid before track requests
+                            if not self.proxy:
+                                logger.warning("Proxy became invalid during track fetching")
+                                # Break out of pagination loop and return partial data
+                                break
+                                
+                            tracks_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
+                            params = {
+                                    'offset': offset,
+                                    'limit': limit,
+                                    'fields': 'items(added_at,track(id,artists(id,name),name,preview_url,duration_ms,album(images,name)))'
+                                    }
 
-            return playlist_data
+                            headers = {'Authorization': f'Bearer {self.access_token}'}
+                            if hasattr(self, 'client_token') and self.client_token:
+                                headers['client-token'] = self.client_token
+
+                            try:
+                                async with self.session.get(
+                                        tracks_url,
+                                        params=params,
+                                        headers=headers,
+                                        proxy=self.proxy.url,
+                                        proxy_auth=self.proxy.auth,
+                                        timeout=10
+                                        ) as response:
+                                    if response.status == 200:
+                                        tracks_data = await response.json()
+                                        all_tracks.extend(tracks_data.get('items', []))
+                                    else:
+                                        logger.warning(f"Failed to fetch tracks at offset {offset}: {response.status}")
+                                        break
+                            except Exception as e:
+                                logger.warning(f"Failed to fetch tracks at offset {offset}: {e}")
+                                break
+
+                            offset += limit
+
+                        # Update the playlist data with all fetched tracks
+                        playlist_data['tracks']['items'] = all_tracks
+
+                    return playlist_data
+                    
+                except Exception as e:
+                    self.logger.error(f"Error in request for playlist {playlist_id}: {e}")
+                    # Clear proxy and retry if it might be a proxy issue
+                    if "proxy" in str(e).lower() or isinstance(e, aiohttp.ClientConnectorError) or isinstance(e, asyncio.TimeoutError):
+                        self.proxy = None
+                    if retry_count < max_retries:
+                        retry_count += 1
+                        await asyncio.sleep(1)
+                        continue
+                    return None
 
         except Exception as e:
-            logger.error(f"Error fetching playlist {playlist_id}: {e}")
+            self.logger.error(f"Error fetching playlist {playlist_id}: {e}")
             return None
         finally:
             self.rate_limiter.release()
@@ -1201,7 +1259,7 @@ class SpotifyAPI:
                 self.session = aiohttp.ClientSession()
 
             if not self.proxy:
-                logger.error("No proxy available")
+                logger.debug("No proxy available")
                 return None
 
             url = f"https://api.spotify.com/v1/artists/{artist_id}"
@@ -1285,7 +1343,7 @@ class SpotifyAPI:
                 self.session = aiohttp.ClientSession()
 
             if not self.proxy:
-                self.logger.error("No proxy available")
+                self.logger.debug("No proxy available")
                 return None
 
             url = "https://api-partner.spotify.com/pathfinder/v1/query"
@@ -1443,7 +1501,7 @@ class SpotifyAPI:
                 self.session = aiohttp.ClientSession()
 
             if not self.proxy:
-                logger.error("No proxy available")
+                logger.debug("No proxy available")
                 return None
 
             url = "https://api-partner.spotify.com/pathfinder/v1/query"
@@ -1832,7 +1890,7 @@ class SpotifyAPI:
                     self.session = aiohttp.ClientSession()
 
                 if not self.proxy:
-                    self.logger.error(f"No proxy available for track fetch (attempt {retry+1})")
+                    self.logger.debug(f"No proxy available for track fetch (attempt {retry+1})")
                     await asyncio.sleep(0.5 * (retry + 1))
                     self.rate_limiter.release()
                     continue
