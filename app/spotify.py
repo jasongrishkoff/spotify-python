@@ -515,11 +515,10 @@ class SpotifyAPI:
         client_token = None
         operation_hashes = {}
         token_event = asyncio.Event()
+        operations_seen = set()  # Moved here from nonlocal declaration
         
         # Track which operations we've seen
-        operations_seen = set()
         operations_to_capture = {
-            #'fetchPlaylistMetadata', 
             'fetchPlaylist', 
             'queryArtistOverview', 
             'getTrack', 
@@ -574,7 +573,7 @@ class SpotifyAPI:
                     
                     # Intercept network requests to extract tokens and hashes
                     async def intercept_request(route):
-                        nonlocal access_token, client_token, operation_hashes, operations_seen
+                        nonlocal access_token, client_token, operation_hashes
                         request = route.request
                         url = request.url
                         
