@@ -21,38 +21,6 @@ A FastAPI service for fetching and caching Spotify data, including playlists, ar
 
 ### Installation
 
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/spotify-api-python.git
-cd spotify-api-python
-```
-
-2. Create a virtual environment and install dependencies:
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-3. Install Playwright browsers:
-```bash
-playwright install chromium
-```
-
-### Running with Docker
-
-```bash
-docker-compose up --build
-```
-
-### Running Locally
-
-1. Start Redis server
-2. Run the FastAPI application:
-```bash
-uvicorn app.main:app --reload
-```
-
 ## Production Deployment with Systemd
 
 The application consists of two services:
@@ -63,7 +31,7 @@ The application consists of two services:
 
 1. Clone the repository to your server (if not already done):
 ```bash
-git clone https://github.com/yourusername/spotify-api-python.git /opt/spotify-api
+git clone https://github.com/jasongrishkoff/spotify-api-python.git /opt/spotify-api
 cd /opt/spotify-api
 ```
 
@@ -136,6 +104,7 @@ sudo systemctl stop spotify-token-worker.service
 - `POST /api/discovered-on`: Get discovered-on data for multiple artists
 - `GET /api/track/{track_id}`: Get track details
 - `POST /api/tracks`: Get multiple tracks
+- - `POST /health`: Status of the tokens
 
 ## Configuration
 
