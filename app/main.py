@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Response, status
+import aiohttp
 import time
 from pydantic import BaseModel, Field
 import random
@@ -73,61 +74,144 @@ async def startup_event():
     asyncio.create_task(mark_app_ready())
 
 async def mark_app_ready():
-    """Wait for tokens to be available before marking app ready"""
+    """Wait for tokens to be available and validated before marking app ready"""
     global app_ready
-    
-    # Check if tokens already exist in Redis
+
     logger.info("Checking if valid tokens already exist")
-    
+
     token_types = ['playlist', 'artist', 'track']
     all_tokens_valid = True
-    
+
     for token_type in token_types:
         if cached := await redis_cache.get_token(token_type):
             proxy_data = cached['proxy']
             if isinstance(proxy_data, str):
                 import json
                 proxy_data = json.loads(proxy_data)
-            
-            # If token is less than 10 minutes old, consider it valid
+
+            # Check age
             created_at = proxy_data.get('created_at', 0)
             age = int(time.time()) - created_at
-            if age < 600:
-                logger.info(f"Found valid {token_type} token (age: {age}s)")
-                continue
-        
-        all_tokens_valid = False
-        break
-    
+
+            # Also perform an actual test request to validate
+            try:
+                spotify_api.access_token = cached['access_token']
+
+                if 'client_token' in cached:
+                    spotify_api.client_token = cached['client_token']
+
+                spotify_api.proxy = ProxyConfig(**proxy_data)
+
+                # Make a test request based on token type
+                success = await _test_token_with_request(token_type)
+
+                if success:
+                    logger.info(f"Validated {token_type} token (age: {age}s) with test request")
+                    continue
+                else:
+                    logger.warning(f"Token test request failed for {token_type}")
+                    all_tokens_valid = False
+                    break
+            except Exception as e:
+                logger.error(f"Error validating {token_type} token: {e}")
+                all_tokens_valid = False
+                break
+        else:
+            logger.warning(f"No {token_type} token available")
+            all_tokens_valid = False
+            break
+
     if all_tokens_valid:
-        logger.info("All tokens are valid, skipping warm-up")
+        logger.info("All tokens are valid, ending warm-up")
         app_ready = True
         return
-    
-    # Otherwise wait for tokens with polling
-    max_wait = 120
+
+    # Poll for tokens with exponential backoff
+    max_wait = 300  # 5 minutes max
     check_interval = 5
+    max_interval = 30
     start_time = time.time()
-    
+
     logger.info(f"Entering warm-up phase for up to {max_wait} seconds")
-    
+
     while time.time() - start_time < max_wait:
-        all_tokens_present = True
+        success_count = 0
+
+        # Check each token type with actual test requests
         for token_type in token_types:
-            if not await redis_cache.get_token(token_type):
-                all_tokens_present = False
-                break
-        
-        if all_tokens_present:
-            logger.info(f"All tokens available after {int(time.time() - start_time)}s, ending warm-up")
+            if cached := await redis_cache.get_token(token_type):
+                try:
+                    spotify_api.access_token = cached['access_token']
+
+                    if 'client_token' in cached:
+                        spotify_api.client_token = cached['client_token']
+
+                    proxy_data = cached['proxy']
+                    if isinstance(proxy_data, str):
+                        proxy_data = json.loads(proxy_data)
+
+                    spotify_api.proxy = ProxyConfig(**proxy_data)
+
+                    # Make a test request
+                    if await _test_token_with_request(token_type):
+                        success_count += 1
+                except Exception as e:
+                    logger.error(f"Error testing {token_type} token: {e}")
+
+        if success_count == len(token_types):
+            logger.info(f"All tokens validated after {int(time.time() - start_time)}s, ending warm-up")
             app_ready = True
             return
-        
+
+        # Exponential backoff with cap
+        check_interval = min(check_interval * 1.5, max_interval)
+        logger.info(f"Not all tokens valid yet ({success_count}/{len(token_types)}), waiting {check_interval:.1f}s")
         await asyncio.sleep(check_interval)
-    
-    # Fallback to timeout
+
+    # Fallback after timeout - log warning but mark as ready to prevent permanent outage
+    logger.warning("Warm-up timeout reached, marking as ready but tokens may be invalid")
     app_ready = True
-    logger.info("Warm-up complete (timeout reached)")
+
+async def _test_token_with_request(token_type):
+    """Test a token with an actual API request to verify it works"""
+    try:
+        if not spotify_api.session:
+            spotify_api.session = aiohttp.ClientSession()
+
+        if token_type == 'playlist':
+            # Test with a known public playlist
+            playlist_id = "37i9dQZEVXcJZyENOWUFo7"  # A Spotify editorial playlist
+            url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks?limit=1"
+        elif token_type == 'artist':
+            # Test with a known artist
+            artist_id = "4gzpq5DPGxSnKTe4SA8HAU"  # Very popular artist
+            url = f"https://api.spotify.com/v1/artists/{artist_id}"
+        elif token_type == 'track':
+            # Test with a known track
+            track_id = "4cOdK2wGLETKBW3PvgPWqT"  # Popular track
+            url = f"https://api.spotify.com/v1/tracks/{track_id}"
+        else:
+            return False
+
+        headers = {'Authorization': f'Bearer {spotify_api.access_token}'}
+        if hasattr(spotify_api, 'client_token') and spotify_api.client_token:
+            headers['client-token'] = spotify_api.client_token
+
+        async with spotify_api.session.get(
+            url,
+            headers=headers,
+            proxy=spotify_api.proxy.url,
+            proxy_auth=spotify_api.proxy.auth,
+            timeout=10
+        ) as response:
+            if response.status == 200:
+                return True
+            else:
+                logger.warning(f"Token test failed with status {response.status}")
+                return False
+    except Exception as e:
+        logger.error(f"Error in token test request: {e}")
+        return False
 
 # Add middleware to check app readiness
 @app.middleware("http")

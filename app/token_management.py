@@ -214,26 +214,34 @@ class TokenManager:
             logger.error(f"Error in discovered hash monitoring: {e}")
 
     async def leadership_check_loop(self):
-        """Periodically check and attempt to become the leader"""
+        """Periodically check and attempt to become the leader with improved reliability"""
         logger.info("Starting leadership check loop")
         
         while True:
             try:
-                # Check if there's a current leader
+                # Check if there's a current leader with heartbeat
                 current_leader = await self.redis_cache.redis.get(self.leader_key)
+                last_heartbeat = await self.redis_cache.redis.get(f"{self.leader_key}_heartbeat")
                 
-                # Use a more reliable approach to determine whether we're the leader
                 current_leader_str = None
                 if current_leader is not None:
-                    if isinstance(current_leader, bytes):
-                        current_leader_str = current_leader.decode('utf-8')
-                    else:
-                        current_leader_str = str(current_leader)
+                    current_leader_str = current_leader.decode('utf-8') if isinstance(current_leader, bytes) else str(current_leader)
+                
+                # Check if current leader has been inactive
+                leader_inactive = False
+                if last_heartbeat is not None:
+                    try:
+                        last_beat = float(last_heartbeat.decode('utf-8') if isinstance(last_heartbeat, bytes) else last_heartbeat)
+                        if time.time() - last_beat > 90:  # Leader considered inactive after 90s without heartbeat
+                            logger.warning(f"Leader {current_leader_str} appears inactive (no heartbeat for >90s)")
+                            leader_inactive = True
+                    except (ValueError, TypeError):
+                        leader_inactive = True
                 
                 is_now_leader = False
                 
-                # No leader exists
-                if current_leader_str is None:
+                # No leader exists or leader is inactive
+                if current_leader_str is None or leader_inactive:
                     # Try to claim leadership with NX option
                     result = await self.redis_cache.redis.set(
                         self.leader_key,
@@ -244,10 +252,18 @@ class TokenManager:
                     is_now_leader = result is not None and result  # Check Redis returned True for NX set
                     
                     if is_now_leader:
-                        logger.info(f"Instance {self.instance_id} claimed leadership (no previous leader)")
+                        logger.info(f"Instance {self.instance_id} claimed leadership" + 
+                                    (f" (previous leader {current_leader_str} inactive)" if leader_inactive else " (no previous leader)"))
                 
-                # We're already the leader, just renew
+                # We're already the leader, update heartbeat and renew
                 elif current_leader_str == self.instance_id:
+                    # Update heartbeat first
+                    await self.redis_cache.redis.set(
+                        f"{self.leader_key}_heartbeat",
+                        str(time.time()),
+                        ex=self.leader_lock_duration * 2  # Longer expiry for heartbeat
+                    )
+                    
                     # Renew our leadership
                     await self.redis_cache.redis.set(
                         self.leader_key,
@@ -260,18 +276,19 @@ class TokenManager:
                 if is_now_leader and not self.is_leader:
                     logger.info(f"Instance {self.instance_id} became the token refresh leader")
                     self.is_leader = True
+                    
+                    # Important: Clear in-progress flags to prevent deadlocks from previous leader
+                    for token_type in self.token_types:
+                        self.refresh_in_progress[token_type] = False
+                    
                     self._start_refresh_tasks()
+                    
+                    # Verify all tokens immediately after becoming leader
+                    asyncio.create_task(self._verify_all_tokens())
                     
                     # Schedule the first hash monitoring after becoming leader
                     asyncio.create_task(self.monitor_discovered_hash())
                     
-                    # Log current state of tokens
-                    for token_type in self.token_types:
-                        if cached := await self.redis_cache.get_token(token_type):
-                            proxy_data = cached['proxy']
-                            created_at = proxy_data.get('created_at', 0) if isinstance(proxy_data, dict) else 0
-                            age = int(time.time()) - created_at
-                            logger.info(f"Current {token_type} token age: {age}s")
                 elif not is_now_leader and self.is_leader:
                     logger.info(f"Instance {self.instance_id} is no longer the token refresh leader")
                     self.is_leader = False
@@ -279,26 +296,51 @@ class TokenManager:
                     
             except Exception as e:
                 logger.error(f"Error in leadership check: {e}")
+                import traceback
+                logger.error(f"Leadership check traceback: {traceback.format_exc()}")
                 
             # Check every 30 seconds
             await asyncio.sleep(self.leader_check_interval)
 
-    def _start_refresh_tasks(self):
-        """Start token refresh tasks when becoming the leader"""
-        logger.info("Starting token refresh tasks")
+    async def _verify_all_tokens(self):
+        """Verify all tokens are valid after becoming leader"""
+        logger.info("New leader verifying all tokens")
         
-        # Start token refresh tasks
         for token_type in self.token_types:
-            if token_type not in self.refresh_tasks or self.refresh_tasks[token_type].done():
-                self.refresh_tasks[token_type] = asyncio.create_task(
-                    self._token_refresh_loop(token_type)
-                )
-                
-        # Start discovered hash refresh task
-        if 'discovered_hash' not in self.refresh_tasks or self.refresh_tasks['discovered_hash'].done():
-            self.refresh_tasks['discovered_hash'] = asyncio.create_task(
-                self._discovered_hash_refresh_loop()
-            )
+            try:
+                if cached := await self.redis_cache.get_token(token_type):
+                    # Set token for validation
+                    self.spotify_api.access_token = cached['access_token']
+                    
+                    if 'client_token' in cached:
+                        self.spotify_api.client_token = cached['client_token']
+                    
+                    proxy_data = cached['proxy']
+                    if isinstance(proxy_data, str):
+                        proxy_data = json.loads(proxy_data)
+                    
+                    self.spotify_api.proxy = ProxyConfig(**proxy_data)
+                    
+                    # Check actual token validity
+                    valid = await self._validate_token(token_type)
+                    
+                    if not valid:
+                        logger.warning(f"New leader found invalid {token_type} token, triggering immediate refresh")
+                        # Clear and queue refresh
+                        await self.redis_cache.clear_token(token_type)
+                        if token_type == 'track':
+                            asyncio.create_task(self.spotify_api._get_track_token())
+                        else:
+                            asyncio.create_task(self.spotify_api._get_token(token_type))
+                else:
+                    logger.warning(f"New leader found missing {token_type} token, triggering immediate refresh")
+                    # Token doesn't exist, trigger refresh
+                    if token_type == 'track':
+                        asyncio.create_task(self.spotify_api._get_track_token())
+                    else:
+                        asyncio.create_task(self.spotify_api._get_token(token_type))
+            except Exception as e:
+                logger.error(f"Error verifying {token_type} token: {e}")
 
     def _stop_refresh_tasks(self):
         """Stop token refresh tasks when leadership is lost"""
