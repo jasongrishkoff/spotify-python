@@ -1,0 +1,21 @@
+[Unit]
+Description=Spotify API Token Worker
+After=network.target
+# Ensure it starts after Redis
+After=redis-server.service
+# Optional: Make it dependent on your main service
+Wants=spotify.service
+
+[Service]
+User=root
+Group=root
+WorkingDirectory=/opt/spotify-api
+Environment="PATH=/opt/spotify-venv/bin"
+ExecStart=/opt/spotify-venv/bin/python /opt/spotify-api/token_worker.py
+Restart=always
+# Make sure the log directory exists
+StandardOutput=append:/var/log/spotify/token-worker.log
+StandardError=append:/var/log/spotify/token-worker.log
+
+[Install]
+WantedBy=multi-user.target

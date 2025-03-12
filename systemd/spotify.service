@@ -1,0 +1,16 @@
+[Unit]
+Description=Spotify API
+After=network.target
+
+[Service]
+User=root
+Group=root
+WorkingDirectory=/opt/spotify-api
+Environment="PATH=/opt/spotify-venv/bin"
+ExecStart=/opt/spotify-venv/bin/gunicorn app.main:app -c gunicorn.conf.py
+Restart=always
+StandardOutput=append:/var/log/spotify/spotify.log
+StandardError=append:/var/log/spotify/spotify.log
+
+[Install]
+WantedBy=multi-user.target
