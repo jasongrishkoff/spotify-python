@@ -289,44 +289,58 @@ class TokenManager:
         """Background task to refresh a specific token type"""
         logger.info(f"Starting {token_type} token refresh loop")
         
+        # Add a local semaphore to ensure only one refresh attempt per token type
+        if not hasattr(self, '_refresh_semaphores'):
+            self._refresh_semaphores = {}
+        
+        if token_type not in self._refresh_semaphores:
+            self._refresh_semaphores[token_type] = asyncio.Semaphore(1)
+        
         while self.is_leader:
             try:
                 # Check if token needs refreshing
                 if await self._check_token_needs_refresh(token_type):
-                    logger.info(f"Refreshing {token_type} token")
-                    
-                    # Track refresh status
-                    self.refresh_in_progress[token_type] = True
-                    
-                    # Acquire lock with a longer timeout for browser operations
-                    if await self.redis_cache.acquire_lock(token_type, timeout=120):
-                        try:
-                            # Double-check after acquiring lock
-                            if await self._check_token_needs_refresh(token_type):
-                                start_time = time.time()
-                                
-                                # Use the appropriate token refresh method
-                                if token_type == 'track':
-                                    success = await self.spotify_api._get_track_token()
-                                else:
-                                    # Call _get_token as instance method, not class method
-                                    success = await self.spotify_api._get_token(token_type)
+                    # Use semaphore to prevent concurrent refreshes of the same type
+                    if self._refresh_semaphores[token_type].locked():
+                        logger.info(f"Another refresh for {token_type} token is already in progress")
+                        await asyncio.sleep(10)
+                        continue
+                        
+                    async with self._refresh_semaphores[token_type]:
+                        logger.info(f"Refreshing {token_type} token")
+                        
+                        # Track refresh status
+                        self.refresh_in_progress[token_type] = True
+                        
+                        # Acquire lock with a longer timeout for browser operations
+                        if await self.redis_cache.acquire_lock(token_type, timeout=120):
+                            try:
+                                # Double-check after acquiring lock
+                                if await self._check_token_needs_refresh(token_type):
+                                    start_time = time.time()
                                     
-                                duration = time.time() - start_time
-                                
-                                if success:
-                                    logger.info(f"{token_type} token refresh succeeded in {duration:.2f}s")
+                                    # Use the appropriate token refresh method
+                                    if token_type == 'track':
+                                        success = await self.spotify_api._get_track_token()
+                                    else:
+                                        # Call _get_token as instance method, not class method
+                                        success = await self.spotify_api._get_token(token_type)
+                                        
+                                    duration = time.time() - start_time
+                                    
+                                    if success:
+                                        logger.info(f"{token_type} token refresh succeeded in {duration:.2f}s")
+                                    else:
+                                        logger.error(f"{token_type} token refresh failed in {duration:.2f}s")
                                 else:
-                                    logger.error(f"{token_type} token refresh failed in {duration:.2f}s")
-                            else:
-                                logger.info(f"{token_type} token was refreshed by another process")
-                        finally:
-                            # Always release the lock
-                            await self.redis_cache.release_lock(token_type)
+                                    logger.info(f"{token_type} token was refreshed by another process")
+                            finally:
+                                # Always release the lock
+                                await self.redis_cache.release_lock(token_type)
+                                self.refresh_in_progress[token_type] = False
+                        else:
+                            logger.info(f"Could not acquire lock for {token_type} token refresh")
                             self.refresh_in_progress[token_type] = False
-                    else:
-                        logger.info(f"Could not acquire lock for {token_type} token refresh")
-                        self.refresh_in_progress[token_type] = False
                 
                 # Sleep for next refresh interval with jitter
                 jitter = random.uniform(-30, 30)
@@ -615,7 +629,7 @@ class SpotifyAPIEnhanced(SpotifyAPI):
         return await self.token_manager.ensure_token(token_type)
         
     async def _get_token(self, token_type: str = 'playlist') -> bool:
-        """Implement token refresh with improved proxy handling"""
+        """Implement token refresh with improved proxy handling and validation"""
         try:
             self.logger.info(f"Getting {token_type} token")
             
@@ -631,7 +645,6 @@ class SpotifyAPIEnhanced(SpotifyAPI):
                     
                 self.proxy = proxy
                 
-                # More browser-like settings
                 try:
                     access_token, client_token, operation_hashes = await self.capture_tokens_and_hashes(
                         self.proxy, 
@@ -639,39 +652,98 @@ class SpotifyAPIEnhanced(SpotifyAPI):
                     )
                     
                     if access_token:
-                        # Save token
+                        # Store original tokens
+                        original_access_token = self.access_token
+                        original_client_token = self.client_token
+                        
+                        # Temporarily set new tokens for validation
                         self.access_token = access_token
                         if client_token:
                             self.client_token = client_token
-                            
-                        # Use token_manager's redis_cache
+                        
+                        # Validate the token
+                        is_valid = False
                         if hasattr(self, 'token_manager') and self.token_manager:
-                            await self.token_manager.redis_cache.save_token(
-                                access_token, 
-                                self.proxy.__dict__, 
-                                token_type=token_type, 
-                                client_token=client_token
-                            )
-                            
-                            # Update hash manager
-                            if operation_hashes and hasattr(self, 'hash_manager'):
-                                await self.hash_manager.update_hashes(operation_hashes)
-                                
-                            self.logger.info(f"Successfully refreshed {token_type} token")
-                            return True
+                            is_valid = await self.token_manager._validate_token(token_type)
                         else:
-                            self.logger.error("No token_manager available")
-                            return False
+                            is_valid = await self._validate_token_simple(token_type)
+                        
+                        if is_valid:
+                            # Token is valid, save it
+                            if hasattr(self, 'token_manager') and self.token_manager:
+                                await self.token_manager.redis_cache.save_token(
+                                    access_token, 
+                                    self.proxy.__dict__, 
+                                    token_type=token_type, 
+                                    client_token=client_token
+                                )
+                                
+                                # Update hash manager
+                                if operation_hashes and hasattr(self, 'hash_manager'):
+                                    await self.hash_manager.update_hashes(operation_hashes)
+                                    
+                                self.logger.info(f"Successfully refreshed and validated {token_type} token")
+                                return True
+                            else:
+                                self.logger.error("No token_manager available")
+                                self.access_token = original_access_token
+                                self.client_token = original_client_token
+                                return False
+                        else:
+                            # Token validation failed, restore previous tokens and try again
+                            self.logger.warning(f"New {token_type} token failed validation (attempt {attempt+1})")
+                            self.access_token = original_access_token
+                            self.client_token = original_client_token
+                            continue
                 except Exception as e:
                     self.logger.warning(f"Error in attempt {attempt+1}: {e}")
                     await asyncio.sleep(3)
                     
-            self.logger.error(f"Failed to get {token_type} token after multiple attempts")
+            self.logger.error(f"Failed to get valid {token_type} token after multiple attempts")
             return False
         except Exception as e:
             self.logger.error(f"Error in _get_token for {token_type}: {e}")
             import traceback
             self.logger.error(f"Traceback: {traceback.format_exc()}")
+            return False
+
+    async def _validate_token_simple(self, token_type: str) -> bool:
+        """Simple validation method when TokenManager is not available."""
+        try:
+            if not self.session:
+                self.session = aiohttp.ClientSession()
+                
+            if not self.access_token or not self.proxy:
+                return False
+                
+            # Choose endpoint based on token type
+            if token_type == 'playlist':
+                url = "https://api.spotify.com/v1/playlists/37i9dQZEVXcJZyENOWUFo7/tracks?limit=1"
+            elif token_type == 'artist':
+                url = "https://api.spotify.com/v1/artists/4gzpq5DPGxSnKTe4SA8HAU"
+            elif token_type == 'track':
+                url = "https://api.spotify.com/v1/tracks/4cOdK2wGLETKBW3PvgPWqT"
+            else:
+                url = "https://api.spotify.com/v1/me"
+                
+            headers = {'Authorization': f'Bearer {self.access_token}'}
+            if hasattr(self, 'client_token') and self.client_token:
+                headers['client-token'] = self.client_token
+                
+            async with self.session.get(
+                url,
+                headers=headers,
+                proxy=self.proxy.url,
+                proxy_auth=self.proxy.auth,
+                timeout=5
+            ) as response:
+                is_valid = response.status == 200
+                if not is_valid:
+                    self.logger.warning(f"Simple token validation failed with status {response.status}")
+                return is_valid
+                
+        except Exception as e:
+            self.logger.error(f"Error in simple token validation: {e}")
             return False
 
     async def _get_track_token(self) -> bool:

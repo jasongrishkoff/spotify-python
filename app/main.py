@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Response, status
 from pydantic import BaseModel, Field
 import random
+import json
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi_utils.tasks import repeat_every
 from pydantic import BaseModel
@@ -19,6 +20,7 @@ class PlaylistRequest(BaseModel):
     ids: List[str]
     with_tracks: Optional[bool] = False
 
+app_ready = False
 app = FastAPI()
 
 # Use the enhanced SpotifyAPI class
@@ -35,9 +37,43 @@ app.add_middleware(
 # We'll set up the token manager during startup
 @app.on_event("startup")
 async def startup_event():
+    global app_ready
+    app_ready = False  # Start in warm-up mode
+    
     # Initialize the token manager
     await setup_token_management(app, spotify_api, redis_cache)
     logger.info("Token management system initialized")
+    
+    # Schedule the app to become ready after tokens are refreshed
+    asyncio.create_task(mark_app_ready())
+
+async def mark_app_ready():
+    """Wait for tokens to refresh before marking the app as ready"""
+    global app_ready
+
+    # Wait for initial token refresh (typically takes 60-90 seconds)
+    wait_time = 120  # 2 minutes
+    logger.info(f"Entering warm-up phase for {wait_time} seconds")
+    await asyncio.sleep(wait_time)
+
+    app_ready = True
+    logger.info("Warm-up complete, app is now ready to serve requests")
+
+# Add middleware to check app readiness
+@app.middleware("http")
+async def check_app_ready(request: Request, call_next):
+    if not app_ready and not request.url.path.startswith("/health"):
+        return Response(
+            content=json.dumps({"detail": "Service is warming up, please try again later"}),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            media_type="application/json"
+        )
+    return await call_next(request)
+
+# Add a health endpoint that works during warm-up
+@app.get("/health")
+async def health():
+    return {"status": "warming_up" if not app_ready else "ready"}
 
 @app.on_event("startup")
 @repeat_every(seconds=604800)  # Run once per week
