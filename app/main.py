@@ -9,7 +9,7 @@ from fastapi_utils.tasks import repeat_every
 from pydantic import BaseModel
 from typing import List, Dict, Optional
 from .spotify import SpotifyAPI, ProxyConfig
-from .token_management import TokenManager, SpotifyAPIEnhanced, setup_token_management
+from .token_management import TokenManager, SpotifyAPIEnhanced
 from .database import AsyncDatabase
 from .cache import RedisCache
 import asyncio
@@ -38,24 +38,29 @@ app.add_middleware(
 
 @app.middleware("http")
 async def limit_requests_on_token_failure(request: Request, call_next):
-    """Prevent request floods during token failures"""
-    # Skip health endpoint and warm-up check
+    """Limit requests when tokens are unavailable"""
+    # Skip health endpoint
     if request.url.path.startswith("/health"):
         return await call_next(request)
 
-    # Check circuit breaker status
-    if hasattr(spotify_api, 'circuit_breaker'):
-        try:
-            if not await spotify_api.circuit_breaker.can_execute():
-                return Response(
-                    content=json.dumps({
-                        "detail": "Service temporarily unavailable due to authentication issues. Please try again later."
-                    }),
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    media_type="application/json"
-                )
-        except Exception as e:
-            logger.error(f"Error checking circuit breaker: {e}")
+    # Check if tokens are available for the relevant endpoint
+    token_type = "playlist"  # Default
+    
+    # Determine token type based on path
+    if "/artist" in request.url.path:
+        token_type = "artist"
+    elif "/track" in request.url.path:
+        token_type = "track"
+    
+    # Check if token exists in Redis
+    if not await redis_cache.get_token(token_type):
+        return Response(
+            content=json.dumps({
+                "detail": "Service temporarily unavailable. Token worker is refreshing credentials."
+            }),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            media_type="application/json"
+        )
 
     # Continue with the request
     return await call_next(request)
@@ -66,63 +71,34 @@ async def startup_event():
     global app_ready
     app_ready = False  # Start in warm-up mode
     
-    # Initialize the token manager
-    await setup_token_management(app, spotify_api, redis_cache)
-    logger.info("Token management system initialized")
+    # Don't initialize the token manager anymore
+    # Just initialize GraphQL hash manager
+    if hasattr(spotify_api, 'hash_manager'):
+        await spotify_api.hash_manager.initialize()
     
-    # Schedule the app to become ready after tokens are refreshed
+    # Schedule the app to become ready after tokens are available
     asyncio.create_task(mark_app_ready())
 
 async def mark_app_ready():
-    """Wait for tokens to be available and validated before marking app ready"""
+    """Check if tokens exist in Redis before marking app ready"""
     global app_ready
 
-    logger.info("Checking if valid tokens already exist")
+    logger.info("Checking if valid tokens exist in Redis")
 
     token_types = ['playlist', 'artist', 'track']
     all_tokens_valid = True
 
     for token_type in token_types:
         if cached := await redis_cache.get_token(token_type):
-            proxy_data = cached['proxy']
-            if isinstance(proxy_data, str):
-                import json
-                proxy_data = json.loads(proxy_data)
-
-            # Check age
-            created_at = proxy_data.get('created_at', 0)
-            age = int(time.time()) - created_at
-
-            # Also perform an actual test request to validate
-            try:
-                spotify_api.access_token = cached['access_token']
-
-                if 'client_token' in cached:
-                    spotify_api.client_token = cached['client_token']
-
-                spotify_api.proxy = ProxyConfig(**proxy_data)
-
-                # Make a test request based on token type
-                success = await _test_token_with_request(token_type)
-
-                if success:
-                    logger.info(f"Validated {token_type} token (age: {age}s) with test request")
-                    continue
-                else:
-                    logger.warning(f"Token test request failed for {token_type}")
-                    all_tokens_valid = False
-                    break
-            except Exception as e:
-                logger.error(f"Error validating {token_type} token: {e}")
-                all_tokens_valid = False
-                break
+            # Token exists in Redis
+            logger.info(f"Found {token_type} token in Redis")
         else:
-            logger.warning(f"No {token_type} token available")
+            logger.warning(f"No {token_type} token available in Redis")
             all_tokens_valid = False
             break
 
     if all_tokens_valid:
-        logger.info("All tokens are valid, ending warm-up")
+        logger.info("All tokens are available in Redis, ending warm-up")
         app_ready = True
         return
 
@@ -135,41 +111,25 @@ async def mark_app_ready():
     logger.info(f"Entering warm-up phase for up to {max_wait} seconds")
 
     while time.time() - start_time < max_wait:
-        success_count = 0
-
-        # Check each token type with actual test requests
+        all_tokens_valid = True
+        
         for token_type in token_types:
-            if cached := await redis_cache.get_token(token_type):
-                try:
-                    spotify_api.access_token = cached['access_token']
-
-                    if 'client_token' in cached:
-                        spotify_api.client_token = cached['client_token']
-
-                    proxy_data = cached['proxy']
-                    if isinstance(proxy_data, str):
-                        proxy_data = json.loads(proxy_data)
-
-                    spotify_api.proxy = ProxyConfig(**proxy_data)
-
-                    # Make a test request
-                    if await _test_token_with_request(token_type):
-                        success_count += 1
-                except Exception as e:
-                    logger.error(f"Error testing {token_type} token: {e}")
-
-        if success_count == len(token_types):
-            logger.info(f"All tokens validated after {int(time.time() - start_time)}s, ending warm-up")
+            if not await redis_cache.get_token(token_type):
+                all_tokens_valid = False
+                break
+                
+        if all_tokens_valid:
+            logger.info(f"All tokens available after {int(time.time() - start_time)}s, ending warm-up")
             app_ready = True
             return
 
         # Exponential backoff with cap
         check_interval = min(check_interval * 1.5, max_interval)
-        logger.info(f"Not all tokens valid yet ({success_count}/{len(token_types)}), waiting {check_interval:.1f}s")
+        logger.info(f"Not all tokens available yet, waiting {check_interval:.1f}s")
         await asyncio.sleep(check_interval)
 
-    # Fallback after timeout - log warning but mark as ready to prevent permanent outage
-    logger.warning("Warm-up timeout reached, marking as ready but tokens may be invalid")
+    # Fallback after timeout
+    logger.warning("Warm-up timeout reached, marking as ready but tokens may be missing")
     app_ready = True
 
 async def _test_token_with_request(token_type):
@@ -224,10 +184,38 @@ async def check_app_ready(request: Request, call_next):
         )
     return await call_next(request)
 
-# Add a health endpoint that works during warm-up
 @app.get("/health")
 async def health():
-    return {"status": "warming_up" if not app_ready else "ready"}
+    """Health check endpoint"""
+    # Check if all required tokens are available
+    token_types = ['playlist', 'artist', 'track']
+    tokens_available = True
+    tokens_status = {}
+    
+    for token_type in token_types:
+        if cached := await redis_cache.get_token(token_type):
+            proxy_data = cached['proxy']
+            if isinstance(proxy_data, str):
+                import json
+                proxy_data = json.loads(proxy_data)
+            
+            created_at = proxy_data.get('created_at', 0)
+            age = int(time.time()) - created_at
+            tokens_status[token_type] = {
+                "available": True,
+                "age_seconds": age
+            }
+        else:
+            tokens_available = False
+            tokens_status[token_type] = {
+                "available": False
+            }
+    
+    return {
+        "status": "ready" if app_ready else "warming_up",
+        "tokens": tokens_status,
+        "token_worker_active": tokens_available
+    }
 
 @app.on_event("startup")
 @repeat_every(seconds=604800)  # Run once per week
@@ -281,19 +269,9 @@ async def scheduled_cleanup():
         logger.error(f"Error in scheduled cleanup: {e}")
         # Don't raise the error - we want the scheduler to continue running
 
-# Keep the browser cleanup task
-@app.on_event("startup")
-@repeat_every(seconds=300)  # Run every 5 minutes
-async def scheduled_browser_cleanup():
-    """Periodic task to clean up any orphaned browser processes"""
-    from .browser_cleanup import cleanup_browsers
-    await cleanup_browsers()
-
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("Shutting down application...")
-    from .browser_cleanup import cleanup_browsers
-    await cleanup_browsers()
     await spotify_api.close()
 
 @app.get("/api/playlist/{playlist_id}")

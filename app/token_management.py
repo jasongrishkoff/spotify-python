@@ -665,13 +665,13 @@ class TokenManager:
                 
             return False
 
-# Enhanced SpotifyAPI class - maintaining original name
+        return await self._get_token('track')
+
 class SpotifyAPIEnhanced(SpotifyAPI):
-    """Enhanced SpotifyAPI class that uses TokenManager"""
+    """Enhanced SpotifyAPI class that only consumes tokens from Redis"""
     
     def __init__(self, db_path: str = 'spotify_cache.db'):
         super().__init__(db_path)
-        self.token_manager = None  # Will be set later
         self._logger = logging.getLogger(__name__)
         
     @property
@@ -679,176 +679,74 @@ class SpotifyAPIEnhanced(SpotifyAPI):
         """Property to access logger"""
         return self._logger
         
-    def set_token_manager(self, token_manager):
-        """Set the token manager instance"""
-        self.token_manager = token_manager
-        
     async def _ensure_auth(self, token_type: str = 'playlist') -> bool:
         """
-        Enhanced auth method that uses the token manager.
+        Simplified auth method that only reads from Redis
         """
-        if not self.token_manager:
-            # Fall back to original implementation if token manager not set
-            return await super()._ensure_auth(token_type)
+        try:
+            # Get token from Redis
+            if cached := await self.cache.get_token(token_type):
+                self.access_token = cached['access_token']
+                
+                if 'client_token' in cached:
+                    self.client_token = cached['client_token']
+                    
+                proxy_data = cached['proxy']
+                if isinstance(proxy_data, str):
+                    import json
+                    proxy_data = json.loads(proxy_data)
+                
+                self.proxy = ProxyConfig(**proxy_data)
+                return True
             
-        # Use token manager to ensure token
-        return await self.token_manager.ensure_token(token_type)
-        
+            return False
+        except Exception as e:
+            self.logger.error(f"Error ensuring token from Redis: {e}")
+            return False
+    
+    # Remove or replace these with stub methods:
     async def _get_token(self, token_type: str = 'playlist') -> bool:
-        """Implement token refresh with improved proxy handling and validation"""
-        try:
-            self.logger.info(f"Getting {token_type} token")
-            
-            # Try multiple proxies if needed
-            for attempt in range(3):
-                # Get a fresh proxy each time
-                self.proxy = None
-                proxy = await self._get_proxy()
-                if not proxy:
-                    self.logger.error(f"Failed to get proxy (attempt {attempt+1})")
-                    await asyncio.sleep(2 * (attempt + 1))
-                    continue
-                    
-                self.proxy = proxy
-                
-                try:
-                    access_token, client_token, operation_hashes = await self.capture_tokens_and_hashes(
-                        self.proxy, 
-                        use_stealth=True
-                    )
-                    
-                    if access_token:
-                        # Store original tokens
-                        original_access_token = self.access_token
-                        original_client_token = self.client_token
-                        
-                        # Temporarily set new tokens for validation
-                        self.access_token = access_token
-                        if client_token:
-                            self.client_token = client_token
-                        
-                        # Validate the token
-                        is_valid = False
-                        if hasattr(self, 'token_manager') and self.token_manager:
-                            is_valid = await self.token_manager._validate_token(token_type)
-                        else:
-                            is_valid = await self._validate_token_simple(token_type)
-                        
-                        if is_valid:
-                            # Token is valid, save it
-                            if hasattr(self, 'token_manager') and self.token_manager:
-                                await self.token_manager.redis_cache.save_token(
-                                    access_token, 
-                                    self.proxy.__dict__, 
-                                    token_type=token_type, 
-                                    client_token=client_token
-                                )
-                                
-                                # Update hash manager
-                                if operation_hashes and hasattr(self, 'hash_manager'):
-                                    await self.hash_manager.update_hashes(operation_hashes)
-                                    
-                                self.logger.info(f"Successfully refreshed and validated {token_type} token")
-                                return True
-                            else:
-                                self.logger.error("No token_manager available")
-                                self.access_token = original_access_token
-                                self.client_token = original_client_token
-                                return False
-                        else:
-                            # Token validation failed, restore previous tokens and try again
-                            self.logger.warning(f"New {token_type} token failed validation (attempt {attempt+1})")
-                            self.access_token = original_access_token
-                            self.client_token = original_client_token
-                            continue
-                except Exception as e:
-                    self.logger.warning(f"Error in attempt {attempt+1}: {e}")
-                    await asyncio.sleep(3)
-                    
-            self.logger.error(f"Failed to get valid {token_type} token after multiple attempts")
-            return False
-        except Exception as e:
-            self.logger.error(f"Error in _get_token for {token_type}: {e}")
-            import traceback
-            self.logger.error(f"Traceback: {traceback.format_exc()}")
-            return False
-
-    async def _validate_token_simple(self, token_type: str) -> bool:
-        """Simple validation method when TokenManager is not available."""
-        try:
-            if not self.session:
-                self.session = aiohttp.ClientSession()
-                
-            if not self.access_token or not self.proxy:
-                return False
-                
-            # Choose endpoint based on token type
-            if token_type == 'playlist':
-                url = "https://api.spotify.com/v1/playlists/37i9dQZEVXcJZyENOWUFo7/tracks?limit=1"
-            elif token_type == 'artist':
-                url = "https://api.spotify.com/v1/artists/4gzpq5DPGxSnKTe4SA8HAU"
-            elif token_type == 'track':
-                url = "https://api.spotify.com/v1/tracks/4cOdK2wGLETKBW3PvgPWqT"
-            else:
-                url = "https://api.spotify.com/v1/me"
-                
-            headers = {'Authorization': f'Bearer {self.access_token}'}
-            if hasattr(self, 'client_token') and self.client_token:
-                headers['client-token'] = self.client_token
-                
-            async with self.session.get(
-                url,
-                headers=headers,
-                proxy=self.proxy.url,
-                proxy_auth=self.proxy.auth,
-                timeout=5
-            ) as response:
-                is_valid = response.status == 200
-                if not is_valid:
-                    self.logger.warning(f"Simple token validation failed with status {response.status}")
-                return is_valid
-                
-        except Exception as e:
-            self.logger.error(f"Error in simple token validation: {e}")
-            return False
-
+        """No longer fetches tokens - tokens come from token_worker"""
+        self.logger.warning("Token refresh attempted but is now handled by external worker")
+        return False
+    
     async def _get_track_token(self) -> bool:
-        """Implement track token refresh directly"""
+        """No longer fetches tokens - tokens come from token_worker"""
         return await self._get_token('track')
 
-# Setup function - keeping the original signature
 async def setup_token_management(app, spotify_api, redis_cache):
-    """Setup integrated token management for the app"""
-    # Create TokenManager
-    token_manager = TokenManager(spotify_api, redis_cache)
-
-    # If SpotifyAPI is enhanced version, set the token manager
-    if hasattr(spotify_api, 'set_token_manager'):
-        spotify_api.set_token_manager(token_manager)
-
-    # Initialize and start on startup
+    """Simplified setup for token consumption only"""
+    
     @app.on_event("startup")
-    async def initialize_token_manager():
-        await token_manager.initialize()
+    async def initialize_token_cache():
+        """Load tokens from Redis on startup"""
+        logger.info("Initializing token cache")
         
-        # Try to become the leader immediately
-        leader_result = await redis_cache.redis.set(
-            token_manager.leader_key,
-            token_manager.instance_id,
-            ex=token_manager.leader_lock_duration,
-            nx=True
-        )
+        # Initialize hash manager if present
+        if hasattr(spotify_api, 'hash_manager'):
+            await spotify_api.hash_manager.initialize()
         
-        if leader_result:
-            logger.info(f"Instance {token_manager.instance_id} claimed initial leadership")
-            token_manager.is_leader = True
-            
-            # Only the leader performs token refresh
-            await token_manager.force_token_refresh_on_startup()
-        else:
-            logger.info(f"Instance {token_manager.instance_id} is not initial leader, skipping token refresh")
-        
-        # Start the token manager for all instances
-        await token_manager.start()
-
-    return token_manager
+        # Load initial tokens
+        token_types = ['playlist', 'artist', 'track']
+        for token_type in token_types:
+            try:
+                if cached := await redis_cache.get_token(token_type):
+                    # Set the token in memory
+                    spotify_api.access_token = cached['access_token']
+                    
+                    if 'client_token' in cached:
+                        spotify_api.client_token = cached['client_token']
+                    
+                    proxy_data = cached['proxy']
+                    if isinstance(proxy_data, str):
+                        import json
+                        proxy_data = json.loads(proxy_data)
+                    
+                    spotify_api.proxy = ProxyConfig(**proxy_data)
+                    logger.info(f"Loaded {token_type} token from cache")
+                else:
+                    logger.warning(f"No {token_type} token available in cache")
+            except Exception as e:
+                logger.error(f"Error initializing {token_type} token: {e}")
+    
+    return None  # No TokenManager instance needed anymore

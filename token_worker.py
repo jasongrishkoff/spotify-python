@@ -64,12 +64,54 @@ class TokenWorker:
         logger.info(f"Received exit signal {signum}")
         self.running = False
         self.shutdown_event.set()
-    
+
+    async def _cleanup_orphaned_browsers(self):
+        """Clean up any orphaned browser processes"""
+        try:
+            # Import psutil within function to avoid global import
+            import psutil
+            
+            chrome_processes = []
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    if any(browser in proc.info['name'].lower()
+                          for browser in ['chrome', 'chromium']):
+                        if any(arg for arg in (proc.info['cmdline'] or [])
+                              if '--headless' in str(arg)):
+                            chrome_processes.append(proc)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
+            for proc in chrome_processes:
+                try:
+                    # Don't kill our own process
+                    if proc.pid != os.getpid():
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=3)
+                        except psutil.TimeoutExpired:
+                            proc.kill()
+                        logger.info(f"Terminated browser process {proc.pid}")
+                except psutil.NoSuchProcess:
+                    continue
+                except Exception as e:
+                    logger.error(f"Error killing process {proc.pid}: {e}")
+
+            if chrome_processes:
+                logger.info(f"Cleaned up {len(chrome_processes)} chrome processes")
+
+        except Exception as e:
+            logger.error(f"Error in browser cleanup: {e}")
+
     async def _worker_loop(self):
         """Main worker loop that manages token and hash refresh"""
         try:
             # Initial token refresh at startup
             await self._refresh_all_tokens()
+            
+            # Track last cleanup time
+            last_browser_cleanup = 0
+            cleanup_interval = 300  # 5 minutes
             
             while self.running:
                 try:
@@ -82,6 +124,12 @@ class TokenWorker:
                     if time.time() - self.last_hash_refresh > self.hash_refresh_interval:
                         await self._refresh_graphql_hashes()
                     
+                    # Periodic browser cleanup
+                    now = time.time()
+                    if now - last_browser_cleanup > cleanup_interval:
+                        await self._cleanup_orphaned_browsers()
+                        last_browser_cleanup = now
+                    
                     # Sleep with check for shutdown
                     for _ in range(10):  # Check shutdown every second
                         if self.shutdown_event.is_set():
@@ -93,11 +141,12 @@ class TokenWorker:
                     await asyncio.sleep(30)  # Longer sleep on error
         
         finally:
-            # Cleanup
+            # Cleanup on exit
+            await self._cleanup_orphaned_browsers()  # Final cleanup
             if self.session and not self.session.closed:
                 await self.session.close()
             logger.info("Token worker stopped")
-    
+
     async def _should_refresh_token(self, token_type: str) -> bool:
         """Check if a token needs refreshing"""
         # Always refresh if we don't have a token
