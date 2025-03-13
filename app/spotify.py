@@ -468,8 +468,103 @@ class SpotifyAPI:
             except Exception as e:
                 logger.error(f"Error during browser cleanup: {str(e)}")
 
+    async def make_api_request(self, url, token_type='playlist', params=None, attempt=0, max_attempts=3):
+        """
+        Make an API request with automatic failover to backup tokens.
+        
+        This method will try the request with the current token, and if it fails,
+        it will try again with backup tokens if available.
+        
+        Args:
+            url (str): URL to request
+            token_type (str): Type of token to use
+            params (dict): Request parameters
+            attempt (int): Current attempt number (for recursion)
+            max_attempts (int): Maximum number of attempts
+            
+        Returns:
+            dict: Response data or None if all attempts failed
+        """
+        if attempt >= max_attempts:
+            logger.error(f"Max attempts reached for {url}")
+            return None
+        
+        # Ensure we have a valid token
+        if not await self._ensure_auth(token_type):
+            logger.error(f"Failed to get valid {token_type} token")
+            return None
+        
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+        
+        # Add client token to headers if available
+        headers = {'Authorization': f'Bearer {self.access_token}'}
+        if self.client_token:
+            headers['client-token'] = self.client_token
+        
+        try:
+            async with self.session.get(
+                url,
+                params=params,
+                headers=headers,
+                proxy=self.proxy.url,
+                proxy_auth=self.proxy.auth,
+                timeout=10
+            ) as response:
+                if response.status == 200:
+                    # Update token health for success
+                    await self.cache.update_token_health(token_type, 0, True)
+                    return await response.json()
+                
+                # Update token health for failure
+                await self.cache.update_token_health(token_type, 0, False)
+                
+                # If token is invalid, clear it and try a backup
+                if response.status in {401, 403, 407}:
+                    logger.warning(f"Token failed with status {response.status} for {url}")
+                    self.access_token = None
+                    self.client_token = None
+                    self.proxy = None
+                    
+                    # Try again with a fresh token (potentially from backup)
+                    return await self.make_api_request(url, token_type, params, attempt + 1, max_attempts)
+                
+                # For other errors, return None
+                logger.warning(f"Request failed with status {response.status} for {url}")
+                return None
+        
+        except asyncio.TimeoutError:
+            logger.warning(f"Request timeout for {url}")
+            # Update token health for failure
+            await self.cache.update_token_health(token_type, 0, False)
+            # Try again with potentially different token
+            return await self.make_api_request(url, token_type, params, attempt + 1, max_attempts)
+        
+        except Exception as e:
+            logger.error(f"Error making request to {url}: {e}")
+            # Update token health for failure
+            await self.cache.update_token_health(token_type, 0, False)
+            
+            # For network errors, try again with potentially different token
+            if isinstance(e, (aiohttp.ClientConnectionError, aiohttp.ClientOSError)):
+                return await self.make_api_request(url, token_type, params, attempt + 1, max_attempts)
+            
+            return None
+
     async def _ensure_auth(self, token_type: str = 'playlist') -> bool:
-        """Ensure we have a valid token with proper backoff and circuit breaking"""
+        """
+        Ensure we have a valid token with improved fallback to backup tokens.
+        
+        This method will try the current token first, then fall back to backup tokens
+        if the current token fails. If a backup token works, it will be promoted to
+        the current position.
+        
+        Args:
+            token_type (str): Type of token to ensure
+            
+        Returns:
+            bool: True if a valid token is available, False otherwise
+        """
         # Check circuit breaker first
         if not await self.circuit_breaker.can_execute():
             logger.warning(f"Circuit breaker open, skipping {token_type} token fetch")
@@ -483,6 +578,8 @@ class SpotifyAPI:
                 
             # Only validate older tokens
             if await self._verify_proxy():
+                # Update token health for success
+                await self.cache.update_token_health(token_type, 0, True)
                 return True
             else:
                 # Proxy is invalid, clear it
@@ -490,62 +587,45 @@ class SpotifyAPI:
                 self.access_token = None
                 self.client_token = None
                 self.proxy = None
+                
+                # Update token health for failure
+                await self.cache.update_token_health(token_type, 0, False)
 
-        # Check cache with progressive backoff
-        max_retries = 3
-        for attempt in range(max_retries):
-            # Try from cache first
-            if cached := await self.cache.get_token(token_type):
-                try:
+        # Try each token (current + backups) until we find a valid one
+        for backup_index in range(4):  # 0 = current, 1-3 = backups
+            try:
+                if cached := await self.cache.get_token(token_type, backup_index):
+                    # Try using this token
                     self.access_token = cached['access_token']
                     if 'client_token' in cached:
                         self.client_token = cached['client_token']
                     
                     proxy_data = cached['proxy']
                     if isinstance(proxy_data, str):
+                        import json
                         proxy_data = json.loads(proxy_data)
                     
                     self.proxy = ProxyConfig(**proxy_data)
                     
-                    # Trust fresh tokens without validation
-                    if time.time() - self.proxy.created_at < 300:  # 5 minutes
-                        await self.circuit_breaker.record_success()
-                        return True
-                        
-                    # Only validate older tokens
+                    # Validate the token
                     if await self._verify_proxy():
+                        # Update token health for success
+                        await self.cache.update_token_health(token_type, backup_index, True)
+                        
+                        # If this was a backup and it worked, promote it to current
+                        if backup_index > 0:
+                            logger.info(f"Promoting {token_type} backup {backup_index} to current position")
+                            await self.cache.promote_backup_token(token_type, backup_index)
+                        
                         await self.circuit_breaker.record_success()
                         return True
-                except Exception as e:
-                    logger.error(f"Error loading cached token: {e}")
-                    
-            # Try to get a new token with lock
-            try:
-                # Only try to get lock on first attempt to prevent deadlock
-                if attempt == 0 and await self.cache.acquire_lock(token_type, timeout=10):
-                    try:
-                        success = await self._get_token(token_type)
-                        if success:
-                            await self.circuit_breaker.record_success()
-                            return True
-                        else:
-                            await self.circuit_breaker.record_failure()
-                    finally:
-                        await self.cache.release_lock(token_type)
-                elif attempt > 0:
-                    # On retry, check if another process got token while we waited
-                    await asyncio.sleep(1)
-                    continue
+                    else:
+                        # Update token health for failure
+                        await self.cache.update_token_health(token_type, backup_index, False)
             except Exception as e:
-                logger.error(f"Error getting token: {e}")
-                await self.circuit_breaker.record_failure()
-            
-            # Exponential backoff with jitter
-            backoff_time = min(30, (2 ** attempt) * (0.5 + random.random()))
-            logger.info(f"Token fetch failed, backing off for {backoff_time:.2f}s")
-            await asyncio.sleep(backoff_time)
+                logger.error(f"Error trying {token_type} token backup {backup_index}: {e}")
         
-        # All attempts failed
+        # All token attempts failed
         await self.circuit_breaker.record_failure()
         return False
 
@@ -970,138 +1050,67 @@ class SpotifyAPI:
         return bool(tracks.get('items', []))
 
     async def _fetch_playlist(self, playlist_id: str, with_tracks: bool = False) -> Optional[Dict]:
-        """Fetch playlist data using Spotify's REST API only"""
+        """Fetch playlist data using Spotify's REST API with improved reliability"""
         try:
             await self.rate_limiter.acquire()
 
-            # Make sure we have valid auth
-            retry_count = 0
-            max_retries = 2
+            # REST API for playlists
+            url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
             
-            while retry_count <= max_retries:
-                if not await self._ensure_auth():
-                    self.logger.error("Failed to get auth token")
-                    return None
+            if with_tracks:
+                fields = "id,name,description,owner(id,display_name),followers(total),images,collaborative,tracks(total,items(added_at,track(id,name,duration_ms,preview_url,artists(id,name),album(images,name))))"
+            else:
+                fields = "id,name,description,owner(id,display_name),followers(total),images,tracks(total),collaborative"
 
-                if not self.session:
-                    self.session = aiohttp.ClientSession()
+            params = {'fields': fields}
 
-                if not self.proxy:
-                    self.logger.error("No proxy available")
-                    if retry_count < max_retries:
-                        retry_count += 1
-                        await asyncio.sleep(1)
-                        continue
-                    return None
+            # Use the make_api_request helper instead of direct API call
+            playlist_data = await self.make_api_request(
+                url=url,
+                token_type='playlist',
+                params=params
+            )
+            
+            if not playlist_data:
+                logger.warning(f"Failed to fetch playlist {playlist_id}")
+                return None
 
-                # REST API for playlists
-                url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
-                
-                if with_tracks:
-                    fields = "id,name,description,owner(id,display_name),followers(total),images,collaborative,tracks(total,items(added_at,track(id,name,duration_ms,preview_url,artists(id,name),album(images,name))))"
-                else:
-                    fields = "id,name,description,owner(id,display_name),followers(total),images,tracks(total),collaborative"
+            # If tracks are requested, fetch them with pagination
+            if with_tracks:
+                all_tracks = []
+                # Calculate how many tracks to fetch (200)
+                total_tracks = min(playlist_data.get('tracks', {}).get('total', 0), 200)
+                offset = 0
+                limit = 100  # Spotify's max limit per request
 
-                params = {'fields': fields}
+                while offset < total_tracks:
+                    tracks_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
+                    tracks_params = {
+                        'offset': offset,
+                        'limit': limit,
+                        'fields': 'items(added_at,track(id,artists(id,name),name,preview_url,duration_ms,album(images,name)))'
+                    }
 
-                headers = {'Authorization': f'Bearer {self.access_token}'}
-                if hasattr(self, 'client_token') and self.client_token:
-                    headers['client-token'] = self.client_token
+                    tracks_data = await self.make_api_request(
+                        url=tracks_url,
+                        token_type='playlist',
+                        params=tracks_params
+                    )
                     
-                try:
-                    async with self.session.get(
-                            url,
-                            params=params,
-                            headers=headers,
-                            proxy=self.proxy.url,
-                            proxy_auth=self.proxy.auth,
-                            timeout=10
-                            ) as response:
-                        if response.status == 200:
-                            playlist_data = await response.json()
-                        elif response.status in {401, 407}:
-                            self.access_token = None
-                            self.client_token = None
-                            self.proxy = None
-                            logger.warning(f"Failed to fetch playlist {playlist_id}: {response.status}")
-                            if retry_count < max_retries:
-                                retry_count += 1
-                                await asyncio.sleep(1)
-                                continue
-                            return None
-                        else:
-                            logger.warning(f"Failed to fetch playlist {playlist_id}: {response.status}")
-                            if retry_count < max_retries:
-                                retry_count += 1
-                                await asyncio.sleep(1)
-                                continue
-                            return None
-
-                    # If tracks are requested, fetch them with pagination
-                    if with_tracks:
-                        all_tracks = []
-                        # Calculate how many tracks to fetch (200)
-                        total_tracks = min(playlist_data.get('tracks', {}).get('total', 0), 200)
-                        offset = 0
-                        limit = 100  # Spotify's max limit per request
-
-                        while offset < total_tracks:
-                            # Check if proxy is still valid before track requests
-                            if not self.proxy:
-                                logger.warning("Proxy became invalid during track fetching")
-                                # Break out of pagination loop and return partial data
-                                break
-                                
-                            tracks_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
-                            params = {
-                                    'offset': offset,
-                                    'limit': limit,
-                                    'fields': 'items(added_at,track(id,artists(id,name),name,preview_url,duration_ms,album(images,name)))'
-                                    }
-
-                            headers = {'Authorization': f'Bearer {self.access_token}'}
-                            if hasattr(self, 'client_token') and self.client_token:
-                                headers['client-token'] = self.client_token
-
-                            try:
-                                async with self.session.get(
-                                        tracks_url,
-                                        params=params,
-                                        headers=headers,
-                                        proxy=self.proxy.url,
-                                        proxy_auth=self.proxy.auth,
-                                        timeout=10
-                                        ) as response:
-                                    if response.status == 200:
-                                        tracks_data = await response.json()
-                                        all_tracks.extend(tracks_data.get('items', []))
-                                    else:
-                                        logger.warning(f"Failed to fetch tracks at offset {offset}: {response.status}")
-                                        break
-                            except Exception as e:
-                                logger.warning(f"Failed to fetch tracks at offset {offset}: {e}")
-                                break
-
-                            offset += limit
-
-                        # Update the playlist data with all fetched tracks
-                        playlist_data['tracks']['items'] = all_tracks
-
-                    return playlist_data
+                    if not tracks_data:
+                        logger.warning(f"Failed to fetch tracks for playlist {playlist_id} at offset {offset}")
+                        break
                     
-                except Exception as e:
-                    self.logger.error(f"Error in request for playlist {playlist_id}: {e}")
-                    # Clear proxy and retry if it might be a proxy issue
-                    if "proxy" in str(e).lower() or isinstance(e, aiohttp.ClientConnectorError) or isinstance(e, asyncio.TimeoutError):
-                        self.proxy = None
-                    if retry_count < max_retries:
-                        retry_count += 1
-                        await asyncio.sleep(1)
-                        continue
-                    return None
+                    all_tracks.extend(tracks_data.get('items', []))
+                    offset += limit
+
+                # Update the playlist data with all fetched tracks
+                playlist_data['tracks']['items'] = all_tracks
+
+            return playlist_data
 
         except Exception as e:
-            self.logger.error(f"Error fetching playlist {playlist_id}: {e}")
+            logger.error(f"Error fetching playlist {playlist_id}: {e}")
             return None
         finally:
             self.rate_limiter.release()
@@ -1351,106 +1360,79 @@ class SpotifyAPI:
         return formatted_data
 
     async def _fetch_artist(self, artist_id: str) -> Optional[Dict]:
-        """Fetch artist data using dynamically captured hashes"""
+        """Fetch artist data using dynamically captured hashes with improved reliability"""
         try:
             await self.rate_limiter.acquire()
-
-            if not await self._ensure_auth():
-                self.logger.error("Failed to get auth token")
-                return None
-
-            if not self.session:
-                self.session = aiohttp.ClientSession()
-
-            if not self.proxy:
-                self.logger.debug("No proxy available")
-                return None
 
             url = "https://api-partner.spotify.com/pathfinder/v1/query"
 
             variables = {
-                    'uri': f'spotify:artist:{artist_id}',
-                    'locale': '',
-                    'includePrerelease': False,
-                    'enableAssociatedVideos': False,
-                    'withSaved': True
-                    }
+                'uri': f'spotify:artist:{artist_id}',
+                'locale': '',
+                'includePrerelease': False,
+                'enableAssociatedVideos': False,
+                'withSaved': True
+            }
 
             # Get hash from hash manager
             artist_hash = await self.hash_manager.get_hash('queryArtistOverview')
-
-            params = {
-                    'operationName': 'queryArtistOverview',
-                    'variables': json.dumps(variables),
-                    'extensions': json.dumps({
-                        'persistedQuery': {
-                            'version': 1,
-                            'sha256Hash': artist_hash
-                            }
-                        })
-                    }
-
-            # Add client token to headers if available
-            headers = {
-                'Authorization': f'Bearer {self.access_token}',
-                'content-type': 'application/json',
-                'accept': 'application/json',
-                'app-platform': 'WebPlayer'
-            }
-            
-            if hasattr(self, 'client_token') and self.client_token:
-                headers['client-token'] = self.client_token
-
-            async with self.session.get(
-                    url,
-                    params=params,
-                    headers=headers,
-                    proxy=self.proxy.url,
-                    proxy_auth=self.proxy.auth,
-                    timeout=10
-                    ) as response:
-                if response.status == 200:
-                    data = await response.json()
-
-                    if 'errors' in data:
-                        error_msg = data.get('errors', [{}])[0].get('message', '')
-                        if 'PersistedQueryNotFound' in error_msg:
-                            # Clear hash to force refresh
-                            await self.hash_manager.save_hash('queryArtistOverview', None)
-                        elif 'NullValueInNonNullableField' in error_msg:
-                            # Handle the null field error gracefully
-                            if 'data' in data and 'artistUnion' in data['data']:
-                                # Replace null values in featuring/playlists with empty objects
-                                if 'relatedContent' in data['data']['artistUnion']:
-                                    related = data['data']['artistUnion']['relatedContent']
-                                    if 'featuringV2' in related and 'items' in related['featuringV2']:
-                                        for i, item in enumerate(related['featuringV2']['items']):
-                                            if 'data' not in item or item['data'] is None:
-                                                related['featuringV2']['items'][i]['data'] = {'__placeholder': True}
-                                
-                                # Ensure these fields exist with defaults
-                                data['data']['artistUnion']['saved'] = data['data']['artistUnion'].get('saved', False)
-                                
-                                # The modified response should now be usable
-                                return data
-                        else:
-                            self.logger.error(f"GraphQL errors in response: {data['errors']}")
-                            return None
-
-                    return data
-
-                elif response.status in {401, 407}:
-                    self.logger.error(f"Authorization error {response.status}")
-                    self.access_token = None
-                    self.client_token = None
-                    self.proxy = None
-                    return None
-
-                self.logger.warning(f"Failed to fetch artist {artist_id}: {response.status}")
+            if not artist_hash:
+                logger.error("No artist hash available")
                 return None
 
+            params = {
+                'operationName': 'queryArtistOverview',
+                'variables': json.dumps(variables),
+                'extensions': json.dumps({
+                    'persistedQuery': {
+                        'version': 1,
+                        'sha256Hash': artist_hash
+                    }
+                })
+            }
+
+            # Use the make_api_request helper
+            data = await self.make_api_request(
+                url=url,
+                token_type='artist',
+                params=params
+            )
+            
+            if not data:
+                return None
+
+            # Check for GraphQL errors
+            if 'errors' in data:
+                error_msg = data.get('errors', [{}])[0].get('message', '')
+                if 'PersistedQueryNotFound' in error_msg:
+                    # Clear hash to force refresh
+                    await self.hash_manager.save_hash('queryArtistOverview', None)
+                    logger.warning("Artist hash invalidated, cleared from cache")
+                    return None
+                elif 'NullValueInNonNullableField' in error_msg:
+                    # Handle the null field error gracefully
+                    if 'data' in data and 'artistUnion' in data['data']:
+                        # Replace null values in featuring/playlists with empty objects
+                        if 'relatedContent' in data['data']['artistUnion']:
+                            related = data['data']['artistUnion']['relatedContent']
+                            if 'featuringV2' in related and 'items' in related['featuringV2']:
+                                for i, item in enumerate(related['featuringV2']['items']):
+                                    if 'data' not in item or item['data'] is None:
+                                        related['featuringV2']['items'][i]['data'] = {'__placeholder': True}
+                            
+                            # Ensure these fields exist with defaults
+                            data['data']['artistUnion']['saved'] = data['data']['artistUnion'].get('saved', False)
+                            
+                            # The modified response should now be usable
+                            return data
+                else:
+                    logger.error(f"GraphQL errors in response: {data['errors']}")
+                    return None
+
+            return data
+
         except Exception as e:
-            self.logger.error(f"Error fetching artist {artist_id}: {e}")
+            logger.error(f"Error fetching artist {artist_id}: {e}")
             return None
         finally:
             self.rate_limiter.release()
@@ -1504,12 +1486,9 @@ class SpotifyAPI:
         return formatted_data
 
     async def _fetch_discovered_on(self, artist_id: str) -> Optional[Dict]:
+        """Fetch discovered-on data with improved reliability"""
         try:
             await self.rate_limiter.acquire()
-
-            if not await self._ensure_auth('artist'):  # Use artist token type
-                logger.error("Failed to get auth token")
-                return None
 
             # Use the helper method to get the hash
             discovered_hash = await self._ensure_discovered_hash()
@@ -1517,90 +1496,54 @@ class SpotifyAPI:
                 logger.error("Could not get discovered-on hash")
                 return None
 
-            if not self.session:
-                self.session = aiohttp.ClientSession()
-
-            if not self.proxy:
-                logger.debug("No proxy available")
-                return None
-
             url = "https://api-partner.spotify.com/pathfinder/v1/query"
 
             variables = {
-                    'uri': f'spotify:artist:{artist_id}',
-                    'locale': ''
-                    }
+                'uri': f'spotify:artist:{artist_id}',
+                'locale': ''
+            }
 
             params = {
-                    'operationName': 'queryArtistDiscoveredOn',
-                    'variables': json.dumps(variables),
-                    'extensions': json.dumps({
-                        'persistedQuery': {
-                            'version': 1,
-                            'sha256Hash': discovered_hash
-                            }
-                        })
+                'operationName': 'queryArtistDiscoveredOn',
+                'variables': json.dumps(variables),
+                'extensions': json.dumps({
+                    'persistedQuery': {
+                        'version': 1,
+                        'sha256Hash': discovered_hash
                     }
-
-            # Add client token to headers if available
-            headers = {
-                'Authorization': f'Bearer {self.access_token}',
-                'content-type': 'application/json',
-                'accept': 'application/json',
-                'app-platform': 'WebPlayer'
+                })
             }
+
+            # Use the make_api_request helper
+            data = await self.make_api_request(
+                url=url,
+                token_type='artist',  # Use artist token type for discovered-on
+                params=params
+            )
             
-            if hasattr(self, 'client_token') and self.client_token:
-                headers['client-token'] = self.client_token
-
-            async with self.session.get(
-                    url,
-                    params=params,
-                    headers=headers,
-                    proxy=self.proxy.url,
-                    proxy_auth=self.proxy.auth,
-                    timeout=10
-                    ) as response:
-
-                if response.status == 200:
-                    data = await response.json()
-
-                    if 'errors' in data:
-                        logger.error(f"GraphQL errors in response: {data['errors']}")
-                        # If we get PersistedQueryNotFound, clear the cached hash
-                        if any(error.get('message') == 'PersistedQueryNotFound' for error in data.get('errors', [])):
-                            await self.cache.redis.delete('spotify_discovered_hash')
-                            # Add this line to trigger the circuit breaker
-                            await self.discovered_hash_circuit_breaker.record_failure(self, self.cache)
-                        return None
-
-                    # Record success
-                    self.discovered_hash_circuit_breaker.record_success()
-                    return data
-
-                elif response.status in {401, 407}:
-                    logger.error(f"Authorization error {response.status}")
-                    error_body = await response.text()
-                    logger.error(f"Auth error response body: {error_body}")
-                    self.access_token = None
-                    self.client_token = None
-                    self.proxy = None
-                    # Add this line to track failures
-                    await self.discovered_hash_circuit_breaker.record_failure(self, self.cache)
-                    return None
-
-                logger.warning(f"Failed to fetch discovered-on {artist_id}: {response.status}")
-                error_body = await response.text()
-                logger.error(f"Error response body: {error_body}")
-                # Add this line to track failures
+            if not data:
                 await self.discovered_hash_circuit_breaker.record_failure(self, self.cache)
                 return None
+
+            # Check for GraphQL errors
+            if 'errors' in data:
+                logger.error(f"GraphQL errors in response: {data['errors']}")
+                # If we get PersistedQueryNotFound, clear the cached hash
+                if any(error.get('message') == 'PersistedQueryNotFound' for error in data.get('errors', [])):
+                    await self.cache.redis.delete('spotify_discovered_hash')
+                    # Trigger the circuit breaker
+                    await self.discovered_hash_circuit_breaker.record_failure(self, self.cache)
+                return None
+
+            # Record success
+            self.discovered_hash_circuit_breaker.record_success()
+            return data
 
         except Exception as e:
             logger.error(f"Error fetching discovered-on {artist_id}: {e}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
-            # Add this line to track failures on exceptions
+            # Track failures on exceptions
             await self.discovered_hash_circuit_breaker.record_failure(self, self.cache)
             return None
         finally:
@@ -1893,169 +1836,81 @@ class SpotifyAPI:
                 }
 
     async def _fetch_track(self, track_id: str, detail: bool = False) -> Optional[Dict]:
-        """Fetch track data using dynamically captured hashes"""
-        for retry in range(3):
-            try:
-                await self.rate_limiter.acquire()
+        """Fetch track data using dynamically captured hashes with improved reliability"""
+        try:
+            await self.rate_limiter.acquire()
 
-                # Auth handling
-                if retry > 0 or not self.access_token or not self.proxy:
-                    if not await self._ensure_auth('track'):
-                        self.logger.error(f"Failed to get track auth token (attempt {retry+1})")
-                        await asyncio.sleep(0.5 * (retry + 1))
-                        self.rate_limiter.release()
-                        continue
+            url = "https://api-partner.spotify.com/pathfinder/v1/query"
 
-                if not self.session:
-                    self.session = aiohttp.ClientSession()
+            variables = {
+                'uri': f'spotify:track:{track_id}'
+            }
 
-                if not self.proxy:
-                    self.logger.debug(f"No proxy available for track fetch (attempt {retry+1})")
-                    await asyncio.sleep(0.5 * (retry + 1))
-                    self.rate_limiter.release()
-                    continue
+            # Get the hash from the hash manager
+            track_hash = await self.hash_manager.get_hash('getTrack')
+            
+            if not track_hash:
+                logger.error("No hash available for track query")
+                return None
 
-                url = "https://api-partner.spotify.com/pathfinder/v1/query"
-
-                variables = {
-                    'uri': f'spotify:track:{track_id}'
-                }
-
-                # Get the hash from the hash manager
-                track_hash = await self.hash_manager.get_hash('getTrack')
-                
-                if not track_hash:
-                    self.logger.error(f"No hash available for track query (attempt {retry+1})")
-                    if retry < 2:
-                        await asyncio.sleep(1)
-                        self.rate_limiter.release()
-                        continue
-                    return None
-
-                extensions = {
+            params = {
+                'operationName': 'getTrack',
+                'variables': json.dumps(variables),
+                'extensions': json.dumps({
                     'persistedQuery': {
                         'version': 1,
                         'sha256Hash': track_hash
                     }
-                }
+                })
+            }
 
-                params = {
-                    'operationName': 'getTrack',
-                    'variables': json.dumps(variables),
-                    'extensions': json.dumps(extensions)
-                }
-
-                # Add client token to headers if available
-                headers = {
-                    'Authorization': f'Bearer {self.access_token}',
-                    'content-type': 'application/json',
-                    'accept': 'application/json',
-                    'app-platform': 'WebPlayer'
-                }
-                
-                if hasattr(self, 'client_token') and self.client_token:
-                    headers['client-token'] = self.client_token
-
-                try:
-                    async with self.session.get(
-                            url,
-                            params=params,
-                            headers=headers,
-                            proxy=self.proxy.url,
-                            proxy_auth=self.proxy.auth,
-                            timeout=10
-                    ) as response:
-                        if response.status == 200:
-                            response_text = await response.text()
-                            data = json.loads(response_text)
-
-                            if 'errors' in data:
-                                error_msg = str(data.get('errors', [{}])[0].get('message', ''))
-                                
-                                # Handle existing error cases...
-                                
-                                # Handle the null trackUnion field error
-                                if 'NullValueInNonNullableField' in error_msg and '/trackUnion' in error_msg:
-                                    self.logger.warning(f"Track data missing for {track_id}, likely deleted or region-restricted")
-                                    # Return a minimal placeholder to avoid crashes
-                                    return {
-                                        'data': {
-                                            'trackUnion': {
-                                                'id': track_id,
-                                                'name': "Unavailable Track",
-                                                'playcount': 0,
-                                                'duration': {'totalMilliseconds': 0},
-                                                'firstArtist': {'items': []},
-                                                'otherArtists': {'items': []},
-                                                '__placeholder': True  # Mark this as placeholder
-                                            }
-                                        }
-                                    }
-                                    
-                                return None
-
-                            if data.get('data', {}).get('trackUnion') is None:
-                                if retry < 2:
-                                    self.logger.warning(f"No track data in response for {track_id} (attempt {retry+1})")
-                                else:
-                                    self.logger.error(f"No track data in response for {track_id}")
-                                
-                                if retry < 2:
-                                    await asyncio.sleep(1)
-                                    self.rate_limiter.release()
-                                    continue
-                                    
-                                return None
-
-                            return data
-
-                        elif response.status in {401, 407}:
-                            error_body = await response.text()
-                            self.logger.error(f"Auth error {response.status} for track {track_id}: {error_body[:200]}")
-                            
-                            self.access_token = None
-                            self.client_token = None
-                            self.proxy = None
-                            
-                            if retry < 2:
-                                await asyncio.sleep(1 * (retry + 1))
-                                self.rate_limiter.release()
-                                continue
-                                
-                            return None
-
-                        else:
-                            error_body = await response.text()
-                            self.logger.warning(f"Failed to fetch track {track_id} with status {response.status} (attempt {retry+1}): {error_body[:200]}")
-                            
-                            if retry < 2:
-                                await asyncio.sleep(1 * (retry + 1))
-                                self.rate_limiter.release()
-                                continue
-                                
-                            return None
-                except asyncio.TimeoutError:
-                    self.logger.warning(f"Timeout fetching track {track_id} (attempt {retry+1})")
-                    if retry < 2:
-                        await asyncio.sleep(1 * (retry + 1))
-                        continue
-                    return None
-
-            except Exception as e:
-                self.logger.error(f"Error fetching track {track_id} (attempt {retry+1}): {e}")
-                
-                if retry < 2:
-                    await asyncio.sleep(1 * (retry + 1))
-                    continue
-                    
-                import traceback
-                self.logger.error(f"Final track fetch error: {traceback.format_exc()}")
+            # Use the make_api_request helper
+            data = await self.make_api_request(
+                url=url,
+                token_type='track',
+                params=params
+            )
+            
+            if not data:
                 return None
-                
-            finally:
-                self.rate_limiter.release()
 
-        return None
+            # Check for GraphQL errors
+            if 'errors' in data:
+                error_msg = str(data.get('errors', [{}])[0].get('message', ''))
+                
+                # Handle the null trackUnion field error
+                if 'NullValueInNonNullableField' in error_msg and '/trackUnion' in error_msg:
+                    logger.warning(f"Track data missing for {track_id}, likely deleted or region-restricted")
+                    # Return a minimal placeholder to avoid crashes
+                    return {
+                        'data': {
+                            'trackUnion': {
+                                'id': track_id,
+                                'name': "Unavailable Track",
+                                'playcount': 0,
+                                'duration': {'totalMilliseconds': 0},
+                                'firstArtist': {'items': []},
+                                'otherArtists': {'items': []},
+                                '__placeholder': True  # Mark this as placeholder
+                            }
+                        }
+                    }
+                
+                logger.error(f"GraphQL errors in track response: {data['errors']}")
+                return None
+
+            # Check if track data is present
+            if data.get('data', {}).get('trackUnion') is None:
+                logger.error(f"No track data in response for {track_id}")
+                return None
+
+            return data
+
+        except Exception as e:
+            logger.error(f"Error fetching track {track_id}: {e}")
+            return None
+        finally:
+            self.rate_limiter.release()
 
     @staticmethod
     def _format_track(track_data: Dict, detail: bool = False) -> Optional[Dict]:

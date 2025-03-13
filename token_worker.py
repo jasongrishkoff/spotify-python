@@ -27,7 +27,7 @@ from app.spotify import ProxyConfig, RateLimiter
 from app.cache import RedisCache
 
 class TokenWorker:
-    """Dedicated worker for managing Spotify API tokens"""
+    """Dedicated worker for managing Spotify API tokens with improved reliability"""
     
     def __init__(self):
         self.redis_cache = RedisCache()
@@ -36,7 +36,7 @@ class TokenWorker:
         self.token_types = ['playlist', 'artist', 'track']
         
         # Configuration
-        self.token_refresh_interval = 240  # 4 minutes
+        self.token_refresh_interval = 180  # Changed from 240 to 180 seconds (10% of validity instead of 15%)
         self.hash_refresh_interval = 3600  # 1 hour
         self.token_validity = 1800  # 30 minutes
         self.shutdown_event = asyncio.Event()
@@ -45,6 +45,9 @@ class TokenWorker:
         # Track the last refresh time for each token type
         self.last_refresh = {token_type: 0 for token_type in self.token_types}
         self.last_hash_refresh = 0
+        
+        # Track token health metrics
+        self.token_health = {}
     
     async def start(self):
         """Start the token worker"""
@@ -64,44 +67,6 @@ class TokenWorker:
         logger.info(f"Received exit signal {signum}")
         self.running = False
         self.shutdown_event.set()
-
-    async def _cleanup_orphaned_browsers(self):
-        """Clean up any orphaned browser processes"""
-        try:
-            # Import psutil within function to avoid global import
-            import psutil
-            
-            chrome_processes = []
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-                try:
-                    if any(browser in proc.info['name'].lower()
-                          for browser in ['chrome', 'chromium']):
-                        if any(arg for arg in (proc.info['cmdline'] or [])
-                              if '--headless' in str(arg)):
-                            chrome_processes.append(proc)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-
-            for proc in chrome_processes:
-                try:
-                    # Don't kill our own process
-                    if proc.pid != os.getpid():
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=3)
-                        except psutil.TimeoutExpired:
-                            proc.kill()
-                        logger.info(f"Terminated browser process {proc.pid}")
-                except psutil.NoSuchProcess:
-                    continue
-                except Exception as e:
-                    logger.error(f"Error killing process {proc.pid}: {e}")
-
-            if chrome_processes:
-                logger.info(f"Cleaned up {len(chrome_processes)} chrome processes")
-
-        except Exception as e:
-            logger.error(f"Error in browser cleanup: {e}")
 
     async def _worker_loop(self):
         """Main worker loop that manages token and hash refresh"""
@@ -148,42 +113,68 @@ class TokenWorker:
             logger.info("Token worker stopped")
 
     async def _should_refresh_token(self, token_type: str) -> bool:
-        """Check if a token needs refreshing"""
-        # Always refresh if we don't have a token
-        if not await self.redis_cache.get_token(token_type):
+        """Check if a token needs refreshing with improved logic"""
+        # Check if we have a current token
+        current_token = await self.redis_cache.get_token(token_type, 0)
+        
+        # Always refresh if we don't have a current token
+        if not current_token:
             logger.info(f"No {token_type} token available, needs refresh")
             return True
         
         # Check token age
         now = time.time()
-        time_since_refresh = now - self.last_refresh[token_type]
         
-        # Refresh if it's been more than refresh_interval since last refresh
+        # Check if token has reached refresh threshold (10% of validity)
+        proxy_data = current_token['proxy']
+        if isinstance(proxy_data, str):
+            proxy_data = json.loads(proxy_data)
+        
+        created_at = proxy_data.get('created_at', 0)
+        age = int(now) - created_at
+        
+        # Refresh if token is >10% of its validity period
+        if age > (self.token_validity * 0.10):
+            logger.info(f"{token_type} token age ({age}s) > 10% of validity, needs refresh")
+            return True
+            
+        # Check health metrics if available
+        if 'health_metrics' in current_token:
+            metrics = current_token['health_metrics']
+            
+            # If the token has had multiple consecutive failures, refresh it
+            if metrics.get('consecutive_failures', 0) >= 3:
+                logger.warning(f"{token_type} token has {metrics['consecutive_failures']} consecutive failures, forcing refresh")
+                return True
+                
+            # If success rate is low, refresh it
+            if metrics.get('success_rate', 1.0) < 0.7 and metrics.get('failure_count', 0) > 5:
+                logger.warning(f"{token_type} token has low success rate ({metrics['success_rate']:.2f}), forcing refresh")
+                return True
+        
+        # Check if it's been a while since last refresh
+        time_since_refresh = now - self.last_refresh[token_type]
         if time_since_refresh > self.token_refresh_interval:
             # Also validate the token
             if not await self._validate_token(token_type):
                 logger.info(f"{token_type} token failed validation, needs refresh")
                 return True
-                
-            if cached := await self.redis_cache.get_token(token_type):
-                proxy_data = cached['proxy']
-                if isinstance(proxy_data, str):
-                    proxy_data = json.loads(proxy_data)
-                
-                created_at = proxy_data.get('created_at', 0)
-                age = int(now) - created_at
-                
-                # If token is >15% of its validity period, refresh it
-                if age > (self.token_validity * 0.15):
-                    logger.info(f"{token_type} token age ({age}s) > 15% of validity, needs refresh")
-                    return True
         
         return False
     
-    async def _validate_token(self, token_type: str) -> bool:
-        """Validate a token by making a simple request"""
+    async def _validate_token(self, token_type: str, backup_index: int = 0) -> bool:
+        """
+        Validate a token by making a simple request.
+        
+        Args:
+            token_type (str): Type of token to validate
+            backup_index (int): Backup index (0 = current, 1-3 = backups)
+            
+        Returns:
+            bool: True if token is valid, False otherwise
+        """
         try:
-            if cached := await self.redis_cache.get_token(token_type):
+            if cached := await self.redis_cache.get_token(token_type, backup_index):
                 access_token = cached.get('access_token')
                 client_token = cached.get('client_token')
                 
@@ -218,12 +209,17 @@ class TokenWorker:
                     timeout=10
                 ) as response:
                     # Check if response is successful
-                    if response.status == 200:
-                        logger.debug(f"{token_type} token validated successfully")
+                    success = response.status == 200
+                    
+                    # Update token health metrics
+                    await self.redis_cache.update_token_health(token_type, backup_index, success)
+                    
+                    if success:
+                        logger.debug(f"{token_type} token (backup {backup_index}) validated successfully")
                         return True
                     
                     # Log error details
-                    logger.warning(f"{token_type} token validation failed with status {response.status}")
+                    logger.warning(f"{token_type} token (backup {backup_index}) validation failed with status {response.status}")
                     if response.status in {401, 407}:
                         error_body = await response.text()
                         logger.warning(f"Error response: {error_body[:200]}")
@@ -233,7 +229,9 @@ class TokenWorker:
             return False
         
         except Exception as e:
-            logger.error(f"Error validating {token_type} token: {e}")
+            logger.error(f"Error validating {token_type} token (backup {backup_index}): {e}")
+            # Update token health metrics for failure
+            await self.redis_cache.update_token_health(token_type, backup_index, False)
             return False
     
     async def _refresh_all_tokens(self):
@@ -250,7 +248,12 @@ class TokenWorker:
         await self._refresh_graphql_hashes()
     
     async def _refresh_token(self, token_type: str):
-        """Refresh a specific token type"""
+        """
+        Refresh a specific token type with improved reliability.
+        
+        This method captures a new token, validates it before saving,
+        and implements the token rotation system.
+        """
         logger.info(f"Refreshing {token_type} token")
         
         # Try to acquire lock to prevent multiple workers from refreshing simultaneously
@@ -272,27 +275,46 @@ class TokenWorker:
             access_token, client_token, operation_hashes = await self._capture_tokens(proxy)
             
             if access_token:
-                # Save the token to Redis
-                success = await self.redis_cache.save_token(
-                    access_token,
-                    proxy.__dict__,
-                    token_type=token_type,
-                    client_token=client_token
-                )
+                # Create initial health metrics for the new token
+                health_metrics = {
+                    'success_count': 0,
+                    'failure_count': 0,
+                    'consecutive_failures': 0,
+                    'success_rate': 1.0,
+                    'last_used': int(time.time())
+                }
                 
-                if success:
-                    logger.info(f"Successfully refreshed {token_type} token")
-                    self.last_refresh[token_type] = time.time()
+                # Before saving, validate the new token
+                valid = await self._validate_specific_token(token_type, access_token, client_token, proxy)
+                
+                if valid:
+                    # Token is valid, save it (this will shift existing tokens to backup slots)
+                    success = await self.redis_cache.save_token(
+                        access_token,
+                        proxy.__dict__,
+                        token_type=token_type,
+                        client_token=client_token,
+                        health_metrics=health_metrics
+                    )
                     
-                    # Update GraphQL hashes if available
-                    if operation_hashes:
-                        for op_name, hash_value in operation_hashes.items():
-                            if hash_value:
-                                await self._save_graphql_hash(op_name, hash_value)
+                    if success:
+                        logger.info(f"Successfully refreshed and validated {token_type} token")
+                        self.last_refresh[token_type] = time.time()
+                        
+                        # Update GraphQL hashes if available
+                        if operation_hashes:
+                            for op_name, hash_value in operation_hashes.items():
+                                if hash_value:
+                                    await self._save_graphql_hash(op_name, hash_value)
+                    else:
+                        logger.error(f"Failed to save {token_type} token to Redis")
                 else:
-                    logger.error(f"Failed to save {token_type} token to Redis")
+                    logger.error(f"New {token_type} token failed validation, not saving")
             else:
                 logger.error(f"Failed to get {token_type} token")
+                
+                # If we failed to get a new token, check if any backups are valid
+                await self._try_promote_valid_backup(token_type)
         
         except Exception as e:
             logger.error(f"Error refreshing {token_type} token: {e}", exc_info=True)
@@ -302,6 +324,123 @@ class TokenWorker:
             self.rate_limiter.release()
             await self.redis_cache.release_lock(token_type)
     
+            return False
+    
+    async def _validate_specific_token(self, token_type: str, access_token: str, client_token: Optional[str], proxy: ProxyConfig) -> bool:
+        """
+        Validate a specific token before saving it.
+
+        Args:
+            token_type (str): Type of token
+            access_token (str): Access token to validate
+            client_token (Optional[str]): Client token
+            proxy (ProxyConfig): Proxy to use
+
+        Returns:
+            bool: True if token is valid, False otherwise
+        """
+        try:
+            # Select test endpoint based on token type
+            if token_type == 'playlist':
+                test_id = "37i9dQZEVXcJZyENOWUFo7"  # Popular playlist
+                url = f"https://api.spotify.com/v1/playlists/{test_id}/tracks?limit=1"
+            elif token_type == 'artist':
+                test_id = "4gzpq5DPGxSnKTe4SA8HAU"  # Popular artist
+                url = f"https://api.spotify.com/v1/artists/{test_id}"
+            elif token_type == 'track':
+                test_id = "4cOdK2wGLETKBW3PvgPWqT"  # Popular track
+                url = f"https://api.spotify.com/v1/tracks/{test_id}"
+            else:
+                url = "https://api.spotify.com/v1/me"
+
+            headers = {'Authorization': f'Bearer {access_token}'}
+            if client_token:
+                headers['client-token'] = client_token
+
+            async with self.session.get(
+                url,
+                headers=headers,
+                proxy=proxy.url,
+                proxy_auth=proxy.auth,
+                timeout=10
+            ) as response:
+                # Check if response is successful
+                if response.status == 200:
+                    logger.info(f"New {token_type} token validated successfully")
+                    return True
+
+                # Log error details
+                logger.warning(f"New {token_type} token validation failed with status {response.status}")
+                if response.status in {401, 407}:
+                    error_body = await response.text()
+                    logger.warning(f"Error response: {error_body[:200]}")
+
+                return False
+
+        except Exception as e:
+            logger.error(f"Error validating new {token_type} token: {e}")
+            return False
+
+    async def _try_promote_valid_backup(self, token_type: str) -> bool:
+        """
+        Try to promote a valid backup token to current position.
+        
+        Args:
+            token_type (str): Type of token
+            
+        Returns:
+            bool: True if a backup was promoted, False otherwise
+        """
+        # Check all backup slots
+        for backup_index in range(1, 4):  # 1, 2, 3
+            if await self.redis_cache.get_token(token_type, backup_index):
+                # Validate the backup
+                if await self._validate_token(token_type, backup_index):
+                    logger.info(f"Found valid {token_type} backup at index {backup_index}, promoting")
+                    success = await self.redis_cache.promote_backup_token(token_type, backup_index)
+                    return success
+        
+        logger.warning(f"No valid {token_type} backups found")
+        return False
+
+    async def _cleanup_orphaned_browsers(self):
+        """Clean up any orphaned browser processes"""
+        try:
+            # Import psutil within function to avoid global import
+            import psutil
+            
+            chrome_processes = []
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    if any(browser in proc.info['name'].lower()
+                          for browser in ['chrome', 'chromium']):
+                        if any(arg for arg in (proc.info['cmdline'] or [])
+                              if '--headless' in str(arg)):
+                            chrome_processes.append(proc)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
+            for proc in chrome_processes:
+                try:
+                    # Don't kill our own process
+                    if proc.pid != os.getpid():
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=3)
+                        except psutil.TimeoutExpired:
+                            proc.kill()
+                        logger.info(f"Terminated browser process {proc.pid}")
+                except psutil.NoSuchProcess:
+                    continue
+                except Exception as e:
+                    logger.error(f"Error killing process {proc.pid}: {e}")
+
+            if chrome_processes:
+                logger.info(f"Cleaned up {len(chrome_processes)} chrome processes")
+
+        except Exception as e:
+            logger.error(f"Error in browser cleanup: {e}")
+
     async def _get_proxy(self) -> Optional[ProxyConfig]:
         """Get a new proxy from the proxy service"""
         for attempt in range(3):
