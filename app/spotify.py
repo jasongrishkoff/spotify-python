@@ -477,6 +477,11 @@ class SpotifyAPI:
             
         # Quick check if we already have a valid token
         if self.access_token and self.proxy:
+            # Trust tokens for a short period without validation
+            if time.time() - self.proxy.created_at < 300:  # 5 minutes
+                return True
+                
+            # Only validate older tokens
             if await self._verify_proxy():
                 return True
             else:
@@ -502,6 +507,12 @@ class SpotifyAPI:
                     
                     self.proxy = ProxyConfig(**proxy_data)
                     
+                    # Trust fresh tokens without validation
+                    if time.time() - self.proxy.created_at < 300:  # 5 minutes
+                        await self.circuit_breaker.record_success()
+                        return True
+                        
+                    # Only validate older tokens
                     if await self._verify_proxy():
                         await self.circuit_breaker.record_success()
                         return True
@@ -541,12 +552,21 @@ class SpotifyAPI:
     async def _verify_proxy(self) -> bool:
         """
         Verify that the current proxy is still valid, with caching to reduce overhead.
+        Modified to trust recently acquired proxies without additional verification.
         """
         if not self.proxy:
             return False
             
         proxy_id = f"{self.proxy.address}:{self.proxy.port}"
         current_time = time.time()
+        
+        # Calculate age of the proxy
+        proxy_age = current_time - self.proxy.created_at
+        
+        # If proxy is very fresh (less than 2 minutes old), trust it without verification
+        # This assumes the token worker already verified it
+        if proxy_age < 240:
+            return True
         
         # If we have a recent validation result, use it
         if proxy_id in self._proxy_validation_cache:
