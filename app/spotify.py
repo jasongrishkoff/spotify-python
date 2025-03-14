@@ -369,7 +369,7 @@ class SpotifyAPI:
         self.cache = RedisCache()
         self.discovered_hash_circuit_breaker = DiscoveredHashCircuitBreaker()
         self.hash_manager = GraphQLHashManager(self.cache)
-        self.circuit_breaker = TokenCircuitBreaker(failure_threshold=5, cooldown_period=30)
+        self.circuit_breaker = TokenCircuitBreaker(failure_threshold=8, cooldown_period=15)
         self.proxy_pool = ProxyPool()
         self._proxy_validation_cache = {}  # Store validation timestamps
         self._proxy_validation_ttl = 300   # Validate every 5 minutes (adjust as needed)
@@ -551,6 +551,23 @@ class SpotifyAPI:
             
             return None
 
+    async def retry_request(self, url, token_type='playlist', params=None, max_retries=3):
+        for attempt in range(max_retries):
+            if attempt > 0:
+                # Exponential backoff
+                await asyncio.sleep(0.5 * (2 ** attempt))
+
+            # Try to refresh tokens if previous attempt failed
+            if attempt > 0 and not await self._ensure_auth(token_type):
+                continue
+
+            # Make the request
+            result = await self.make_api_request(url, token_type, params)
+            if result:
+                return result
+
+        return None
+
     async def _ensure_auth(self, token_type: str = 'playlist') -> bool:
         """
         Ensure we have a valid token with improved fallback to backup tokens.
@@ -561,7 +578,7 @@ class SpotifyAPI:
         
         Args:
             token_type (str): Type of token to ensure
-            
+                
         Returns:
             bool: True if a valid token is available, False otherwise
         """
@@ -575,7 +592,7 @@ class SpotifyAPI:
             # Trust tokens for a short period without validation
             if time.time() - self.proxy.created_at < 300:  # 5 minutes
                 return True
-                
+                    
             # Only validate older tokens
             if await self._verify_proxy():
                 # Update token health for success
@@ -587,7 +604,7 @@ class SpotifyAPI:
                 self.access_token = None
                 self.client_token = None
                 self.proxy = None
-                
+                    
                 # Update token health for failure
                 await self.cache.update_token_health(token_type, 0, False)
 
@@ -1065,7 +1082,7 @@ class SpotifyAPI:
             params = {'fields': fields}
 
             # Use the make_api_request helper instead of direct API call
-            playlist_data = await self.make_api_request(
+            playlist_data = await self.retry_request(
                 url=url,
                 token_type='playlist',
                 params=params
@@ -1091,7 +1108,7 @@ class SpotifyAPI:
                         'fields': 'items(added_at,track(id,artists(id,name),name,preview_url,duration_ms,album(images,name)))'
                     }
 
-                    tracks_data = await self.make_api_request(
+                    tracks_data = await self.retry_request(
                         url=tracks_url,
                         token_type='playlist',
                         params=tracks_params
@@ -1392,7 +1409,7 @@ class SpotifyAPI:
             }
 
             # Use the make_api_request helper
-            data = await self.make_api_request(
+            data = await self.retry_request(
                 url=url,
                 token_type='artist',
                 params=params
@@ -1404,30 +1421,74 @@ class SpotifyAPI:
             # Check for GraphQL errors
             if 'errors' in data:
                 error_msg = data.get('errors', [{}])[0].get('message', '')
+                
                 if 'PersistedQueryNotFound' in error_msg:
                     # Clear hash to force refresh
                     await self.hash_manager.save_hash('queryArtistOverview', None)
                     logger.warning("Artist hash invalidated, cleared from cache")
                     return None
-                elif 'NullValueInNonNullableField' in error_msg:
+                
+                elif 'NullValueInNonNullableField' in error_msg or 'Server error' in error_msg:
                     # Handle the null field error gracefully
                     if 'data' in data and 'artistUnion' in data['data']:
-                        # Replace null values in featuring/playlists with empty objects
-                        if 'relatedContent' in data['data']['artistUnion']:
+                        # Fix relatedContent null value
+                        if data['data']['artistUnion'] is not None and 'relatedContent' not in data['data']['artistUnion']:
+                            logger.info(f"Adding missing relatedContent for artist {artist_id}")
+                            data['data']['artistUnion']['relatedContent'] = {
+                                "discoveredOnV2": {"items": []},
+                                "featuring": {"items": []},
+                                "featuringV2": {"items": []},
+                                "appearsOn": {"items": []},
+                                "appearsOnV2": {"items": []},
+                                "playlists": {"items": []}
+                            }
+                        
+                        # If artistUnion is present but relatedContent is null
+                        if data['data']['artistUnion'] is not None and data['data']['artistUnion'].get('relatedContent') is None:
+                            logger.info(f"Fixing null relatedContent for artist {artist_id}")
+                            data['data']['artistUnion']['relatedContent'] = {
+                                "discoveredOnV2": {"items": []},
+                                "featuring": {"items": []},
+                                "featuringV2": {"items": []},
+                                "appearsOn": {"items": []},
+                                "appearsOnV2": {"items": []},
+                                "playlists": {"items": []}
+                            }
+                        
+                        # Fix null items in featuringV2
+                        if data['data']['artistUnion'] is not None and 'relatedContent' in data['data']['artistUnion']:
                             related = data['data']['artistUnion']['relatedContent']
-                            if 'featuringV2' in related and 'items' in related['featuringV2']:
-                                for i, item in enumerate(related['featuringV2']['items']):
-                                    if 'data' not in item or item['data'] is None:
-                                        related['featuringV2']['items'][i]['data'] = {'__placeholder': True}
                             
-                            # Ensure these fields exist with defaults
-                            data['data']['artistUnion']['saved'] = data['data']['artistUnion'].get('saved', False)
+                            # Fix featuringV2 items
+                            if related and 'featuringV2' in related and related.get('featuringV2') is not None:
+                                featuring = related['featuringV2']
+                                if 'items' in featuring:
+                                    for i, item in enumerate(featuring['items']):
+                                        if item is None or 'data' not in item or item['data'] is None:
+                                            featuring['items'][i] = {'data': {'__placeholder': True}}
+                            elif related and ('featuringV2' not in related or related.get('featuringV2') is None):
+                                related['featuringV2'] = {"items": []}
                             
-                            # The modified response should now be usable
-                            return data
-                else:
-                    logger.error(f"GraphQL errors in response: {data['errors']}")
-                    return None
+                            # Fix discoveredOnV2 field if missing or null
+                            if related and ('discoveredOnV2' not in related or related.get('discoveredOnV2') is None):
+                                related['discoveredOnV2'] = {"items": []}
+                            
+                            # Ensure other sections exist to prevent potential null issues
+                            sections = ['featuring', 'appearsOn', 'appearsOnV2', 'playlists']
+                            for section in sections:
+                                if related and (section not in related or related.get(section) is None):
+                                    related[section] = {"items": []}
+                        
+                        # Set default saved value if missing
+                        if data['data']['artistUnion'] is not None and 'saved' not in data['data']['artistUnion']:
+                            data['data']['artistUnion']['saved'] = False
+                        
+                        # The modified response should now be usable
+                        return data
+                
+                # For other types of errors, log them in detail
+                logger.error(f"GraphQL errors in response for artist {artist_id}: {data['errors']}")
+                return None
 
             return data
 
@@ -1515,7 +1576,7 @@ class SpotifyAPI:
             }
 
             # Use the make_api_request helper
-            data = await self.make_api_request(
+            data = await self.retry_request(
                 url=url,
                 token_type='artist',  # Use artist token type for discovered-on
                 params=params
@@ -1865,7 +1926,7 @@ class SpotifyAPI:
             }
 
             # Use the make_api_request helper
-            data = await self.make_api_request(
+            data = await self.retry_request(
                 url=url,
                 token_type='track',
                 params=params
