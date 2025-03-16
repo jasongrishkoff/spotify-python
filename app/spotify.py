@@ -1075,7 +1075,7 @@ class SpotifyAPI:
             url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
             
             if with_tracks:
-                fields = "id,name,description,owner(id,display_name),followers(total),images,collaborative,tracks(total,items(added_at,track(id,name,duration_ms,preview_url,artists(id,name),album(images(url)))))"
+                fields = "id,name,description,owner(id,display_name),followers(total),images(url),collaborative,tracks(total,items(added_at,track(id,name,duration_ms,preview_url,artists(id,name),album(images(url)))))"
             else:
                 fields = "id,name,description,owner(id,display_name),followers(total),images(url),tracks(total),collaborative"
 
