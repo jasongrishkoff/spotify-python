@@ -1075,9 +1075,9 @@ class SpotifyAPI:
             url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
             
             if with_tracks:
-                fields = "id,name,description,owner(id,display_name),followers(total),images,collaborative,tracks(total,items(added_at,track(id,name,duration_ms,preview_url,artists(id,name),album(images,name))))"
+                fields = "id,name,description,owner(id,display_name),followers(total),images,collaborative,tracks(total,items(added_at,track(id,name,duration_ms,preview_url,artists(id,name),album(images(url)))))"
             else:
-                fields = "id,name,description,owner(id,display_name),followers(total),images,tracks(total),collaborative"
+                fields = "id,name,description,owner(id,display_name),followers(total),images(url),tracks(total),collaborative"
 
             params = {'fields': fields}
 
@@ -1105,7 +1105,7 @@ class SpotifyAPI:
                     tracks_params = {
                         'offset': offset,
                         'limit': limit,
-                        'fields': 'items(added_at,track(id,artists(id,name),name,preview_url,duration_ms,album(images,name)))'
+                        'fields': 'items(added_at,track(id,artists(id,name),name,preview_url,duration_ms,album(images(url))))'
                     }
 
                     tracks_data = await self.retry_request(
