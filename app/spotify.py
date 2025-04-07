@@ -1838,15 +1838,23 @@ class SpotifyAPI:
             self,
             track_ids: List[str],
             skip_cache: bool = False,
-            detail: bool = False
+            detail: bool = False,
+            official: bool = False  # Add official parameter
             ) -> Dict[str, Optional[Dict]]:
-        """Get track data for multiple track IDs"""
+        """Get track data for multiple track IDs, optionally using Spotify's official API"""
         await self._ensure_initialized()
         unique_ids = list(dict.fromkeys(track_ids))
 
-        if skip_cache:
+        # When using official API, skip cache for simplicity
+        if official or skip_cache:
+            # Choose the appropriate fetch method based on official flag
+            fetch_method = self._fetch_track_official if official else self._fetch_track
+            
+            # For official API, we'll return raw data rather than formatting it
+            format_method = (lambda x, _: x) if official else self._format_track
+
             fetch_tasks = [
-                    self._fetch_track(tid, detail)
+                    fetch_method(tid)
                     for tid in unique_ids
                     ]
             fetched_data = await asyncio.gather(*fetch_tasks, return_exceptions=True)
@@ -1854,12 +1862,25 @@ class SpotifyAPI:
             results = {}
             for i, data in enumerate(fetched_data):
                 if isinstance(data, dict):
-                    formatted = self._format_track(data, detail)
+                    formatted = format_method(data, detail)
                     if formatted:
                         results[unique_ids[i]] = formatted
 
+            # Only cache non-official data
+            if not official and results:
+                valid_tracks = []
+                for track_id, track_data in results.items():
+                    if track_data:
+                        track_copy = track_data.copy()
+                        track_copy['id'] = track_id
+                        valid_tracks.append(track_copy)
+                
+                if valid_tracks:
+                    await self.db.save_tracks(valid_tracks)
+
             return results
 
+        # Standard non-official cached fetch (existing code)
         # Get all cached data
         cached_data = await self.db.get_tracks(unique_ids)
 
@@ -2031,3 +2052,52 @@ class SpotifyAPI:
                 logger.info(f"Used URI as fallback ID: {formatted_data['id']}")
 
         return formatted_data
+
+    async def _fetch_track_official(self, track_id: str) -> Optional[Dict]:
+        """Fetch track data from Spotify's public API with client token"""
+        try:
+            await self.rate_limiter.acquire()
+
+            if not await self._ensure_auth('track'):
+                logger.error("Failed to get auth token for track API")
+                return None
+
+            if not self.session:
+                self.session = aiohttp.ClientSession()
+
+            if not self.proxy:
+                logger.debug("No proxy available")
+                return None
+
+            url = f"https://api.spotify.com/v1/tracks/{track_id}"
+
+            # Add client token to headers if available
+            headers = {'Authorization': f'Bearer {self.access_token}'}
+
+            if hasattr(self, 'client_token') and self.client_token:
+                headers['client-token'] = self.client_token
+
+            async with self.session.get(
+                    url,
+                    headers=headers,
+                    proxy=self.proxy.url,
+                    proxy_auth=self.proxy.auth,
+                    timeout=10
+                    ) as response:
+                if response.status == 200:
+                    return await response.json()
+                elif response.status in {401, 407}:
+                    logger.error(f"Authorization error {response.status}")
+                    self.access_token = None
+                    self.client_token = None
+                    self.proxy = None
+                    return None
+
+                logger.warning(f"Failed to fetch track {track_id} from official API: {response.status}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error fetching track {track_id} from official API: {e}")
+            return None
+        finally:
+            self.rate_limiter.release()

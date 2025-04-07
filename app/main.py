@@ -375,63 +375,63 @@ async def shutdown_event():
 
 @app.get("/api/playlist/{playlist_id}")
 async def get_playlist(
-		playlist_id: str,
-		with_tracks: bool = False,
-		raw_data: bool = False,
-		):
-	"""Get a single playlist by ID"""
-	try:
-		# First try to get the playlist
-		results = await spotify_api.get_playlists([playlist_id], with_tracks=with_tracks, skip_cache=True, raw_data=raw_data)
+        playlist_id: str,
+        with_tracks: bool = False,
+        raw_data: bool = False,
+        ):
+    """Get a single playlist by ID"""
+    try:
+        # First try to get the playlist
+        results = await spotify_api.get_playlists([playlist_id], with_tracks=with_tracks, skip_cache=True, raw_data=raw_data)
 
-		if not results:
-			raise HTTPException(status_code=404, detail="Playlist not found")
+        if not results:
+            raise HTTPException(status_code=404, detail="Playlist not found")
 
-		# Safely handle dictionary access
-		playlist = None
-		try:
-			playlist = results.get(playlist_id)
-		except AttributeError as e:
-			raise HTTPException(status_code=500, detail="Invalid response format")
+        # Safely handle dictionary access
+        playlist = None
+        try:
+            playlist = results.get(playlist_id)
+        except AttributeError as e:
+            raise HTTPException(status_code=500, detail="Invalid response format")
 
-		if not playlist:
-			raise HTTPException(status_code=404, detail="Playlist not found")
+        if not playlist:
+            raise HTTPException(status_code=404, detail="Playlist not found")
 
-		return playlist
+        return playlist
 
-	except Exception as e:
-		logger.error(f"Error fetching playlist {playlist_id}: {e}")
-		logger.error(f"Error type: {type(e)}")
-		import traceback
-		logger.error(f"Traceback: {traceback.format_exc()}")
-		raise HTTPException(status_code=500, detail="Internal server error")
+    except Exception as e:
+        logger.error(f"Error fetching playlist {playlist_id}: {e}")
+        logger.error(f"Error type: {type(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/playlists")
 async def get_playlists(
-		request: PlaylistRequest,
-		):
-	"""Get multiple playlists by their IDs"""
-	try:
-		if not request.ids:
-			raise HTTPException(status_code=400, detail="No playlist IDs provided")
+        request: PlaylistRequest,
+        ):
+    """Get multiple playlists by their IDs"""
+    try:
+        if not request.ids:
+            raise HTTPException(status_code=400, detail="No playlist IDs provided")
 
-		playlist_ids = request.ids[:200]
-		results = await spotify_api.get_playlists(playlist_ids, with_tracks=request.with_tracks)
+        playlist_ids = request.ids[:200]
+        results = await spotify_api.get_playlists(playlist_ids, with_tracks=request.with_tracks)
 
-		# Convert to array and filter out None values
-		valid_results = [
-				data
-				for data in results.values()
-				if data is not None
-				]
+        # Convert to array and filter out None values
+        valid_results = [
+                data
+                for data in results.values()
+                if data is not None
+                ]
 
-		if not valid_results:
-			raise HTTPException(status_code=404, detail="No valid playlists found")
+        if not valid_results:
+            raise HTTPException(status_code=404, detail="No valid playlists found")
 
-		return valid_results
-	except Exception as e:
-		logger.error(f"Error fetching playlists: {e}")
-		raise HTTPException(status_code=500, detail="Internal server error")
+        return valid_results
+    except Exception as e:
+        logger.error(f"Error fetching playlists: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 class ArtistRequest(BaseModel):
     ids: List[str]
@@ -445,46 +445,46 @@ class ArtistRequest(BaseModel):
 
 @app.get("/api/artist/{artist_id}")
 async def get_artist(
-		artist_id: str,
-		detail: bool = False,
-		official: bool = False  # New parameter
-		):
-	"""
-	Get a single artist by ID.
-	Use official=true to use Spotify's public API instead of partner API.
-	Optionally return detailed data when detail=true
-	"""
-	try:
-		# First try to get the artist
-		results = await spotify_api.get_artists([artist_id], skip_cache=True, detail=detail, official=official)
+        artist_id: str,
+        detail: bool = False,
+        official: bool = False  # New parameter
+        ):
+    """
+    Get a single artist by ID.
+    Use official=true to use Spotify's public API instead of partner API.
+    Optionally return detailed data when detail=true
+    """
+    try:
+        # First try to get the artist
+        results = await spotify_api.get_artists([artist_id], skip_cache=True, detail=detail, official=official)
 
-		if not results:
-			logger.warning(f"No results returned for artist {artist_id}")
-			raise HTTPException(status_code=404, detail="Artist not found")
+        if not results:
+            logger.warning(f"No results returned for artist {artist_id}")
+            raise HTTPException(status_code=404, detail="Artist not found")
 
-		# Safely handle dictionary access
-		artist = None
-		try:
-			artist = results.get(artist_id)
-		except AttributeError as e:
-			logger.error(f"Results is not a dictionary. Type: {type(results)}")
-			logger.error(f"Results content: {results}")
-			raise HTTPException(status_code=500, detail="Invalid response format")
+        # Safely handle dictionary access
+        artist = None
+        try:
+            artist = results.get(artist_id)
+        except AttributeError as e:
+            logger.error(f"Results is not a dictionary. Type: {type(results)}")
+            logger.error(f"Results content: {results}")
+            raise HTTPException(status_code=500, detail="Invalid response format")
 
-		if not artist:
-			logger.warning(f"Artist {artist_id} not found in results dictionary")
-			raise HTTPException(status_code=404, detail="Artist not found")
+        if not artist:
+            logger.warning(f"Artist {artist_id} not found in results dictionary")
+            raise HTTPException(status_code=404, detail="Artist not found")
 
-		return artist
+        return artist
 
-	except Exception as e:
-		logger.error(f"Error fetching artist {artist_id}: {e}")
-		logger.error(f"Error type: {type(e)}")
-		import traceback
-		logger.error(f"Full traceback: {traceback.format_exc()}")
-		if isinstance(e, HTTPException):
-			raise
-		raise HTTPException(status_code=500, detail="Internal server error")
+    except Exception as e:
+        logger.error(f"Error fetching artist {artist_id}: {e}")
+        logger.error(f"Error type: {type(e)}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/artists")
 async def get_artists(request: ArtistRequest):
@@ -522,127 +522,132 @@ async def get_artists(request: ArtistRequest):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 class DiscoveredRequest(BaseModel):
-	ids: List[str]
+    ids: List[str]
 
 @app.get("/api/discovered-on/{artist_id}")
 async def get_discovered_on(
-	artist_id: str,
+    artist_id: str,
 ):
-	"""Get discovered-on data for a single artist"""
-	try:
-		results = await spotify_api.get_discovered_on([artist_id], skip_cache=True)
+    """Get discovered-on data for a single artist"""
+    try:
+        results = await spotify_api.get_discovered_on([artist_id], skip_cache=True)
 
-		if not results:
-			raise HTTPException(status_code=404, detail="Artist not found")
+        if not results:
+            raise HTTPException(status_code=404, detail="Artist not found")
 
-		artist_data = results.get(artist_id)
-		if not artist_data:
-			raise HTTPException(status_code=404, detail="Artist not found")
+        artist_data = results.get(artist_id)
+        if not artist_data:
+            raise HTTPException(status_code=404, detail="Artist not found")
 
-		return artist_data
+        return artist_data
 
-	except Exception as e:
-		logger.error(f"Error fetching discovered-on {artist_id}: {e}")
-		if isinstance(e, HTTPException):
-			raise
-		raise HTTPException(status_code=500, detail="Internal server error")
+    except Exception as e:
+        logger.error(f"Error fetching discovered-on {artist_id}: {e}")
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/discovered-on")
 async def get_multiple_discovered_on(
-	request: DiscoveredRequest,
+    request: DiscoveredRequest,
 ):
-	"""Get discovered-on data for multiple artists"""
-	try:
-		if not request.ids:
-			raise HTTPException(status_code=400, detail="No artist IDs provided")
+    """Get discovered-on data for multiple artists"""
+    try:
+        if not request.ids:
+            raise HTTPException(status_code=400, detail="No artist IDs provided")
 
-		discovered_on_ids = request.ids[:200]
-		results = await spotify_api.get_discovered_on(discovered_on_ids)
+        discovered_on_ids = request.ids[:200]
+        results = await spotify_api.get_discovered_on(discovered_on_ids)
 
-		if not results:
-			raise HTTPException(status_code=404, detail="No valid artists found")
+        if not results:
+            raise HTTPException(status_code=404, detail="No valid artists found")
 
-		return list(results.values())
+        return list(results.values())
 
-	except Exception as e:
-		logger.error(f"Error fetching discovered-on: {e}")
-		if isinstance(e, HTTPException):
-			raise
-		raise HTTPException(status_code=500, detail="Internal server error")
+    except Exception as e:
+        logger.error(f"Error fetching discovered-on: {e}")
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 class TrackRequest(BaseModel):
-	ids: List[str]
+    ids: List[str]
+    official: Optional[bool] = Field(default=False)
 
 @app.get("/api/track/{track_id}")
 async def get_track(
-	track_id: str,
+    track_id: str,
+    official: bool = False,  # Add official parameter
 ):
-	"""Get a single track by ID"""
-	try:
-		results = await spotify_api.get_tracks([track_id], skip_cache=True)
+    """
+    Get a single track by ID.
+    Use official=true to use Spotify's public API instead of partner API.
+    """
+    try:
+        results = await spotify_api.get_tracks([track_id], skip_cache=True, official=official)
 
-		if not results:
-			raise HTTPException(status_code=404, detail="Track not found")
+        if not results:
+            raise HTTPException(status_code=404, detail="Track not found")
 
-		track = results.get(track_id)
-		if not track:
-			raise HTTPException(status_code=404, detail="Track not found")
+        track = results.get(track_id)
+        if not track:
+            raise HTTPException(status_code=404, detail="Track not found")
 
-		return track
+        return track
 
-	except Exception as e:
-		logger.error(f"Error fetching track {track_id}: {e}")
-		if isinstance(e, HTTPException):
-			raise
-		raise HTTPException(status_code=500, detail="Internal server error")
+    except Exception as e:
+        logger.error(f"Error fetching track {track_id}: {e}")
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/track-detail/{track_id}")
 async def get_track_detail(
-		track_id: str,
-		):
-	"""Get detailed track information by ID"""
-	try:
-		results = await spotify_api.get_tracks([track_id], skip_cache=True, detail=True)
+        track_id: str,
+        ):
+    """Get detailed track information by ID"""
+    try:
+        results = await spotify_api.get_tracks([track_id], skip_cache=True, detail=True)
 
-		if not results:
-			raise HTTPException(status_code=404, detail="Track not found")
+        if not results:
+            raise HTTPException(status_code=404, detail="Track not found")
 
-		track = results.get(track_id)
-		if not track:
-			raise HTTPException(status_code=404, detail="Track not found")
+        track = results.get(track_id)
+        if not track:
+            raise HTTPException(status_code=404, detail="Track not found")
 
-		return track
+        return track
 
-	except Exception as e:
-		logger.error(f"Error fetching track detail {track_id}: {e}")
-		if isinstance(e, HTTPException):
-			raise
-		raise HTTPException(status_code=500, detail="Internal server error")
+    except Exception as e:
+        logger.error(f"Error fetching track detail {track_id}: {e}")
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/tracks")
 async def get_tracks(
-		request: TrackRequest,
-		):
-	"""Get multiple tracks by their IDs"""
-	try:
-		if not request.ids:
-			raise HTTPException(status_code=400, detail="No track IDs provided")
+    request: TrackRequest,
+):
+    """Get multiple tracks by their IDs, optionally using Spotify's official API"""
+    try:
+        if not request.ids:
+            raise HTTPException(status_code=400, detail="No track IDs provided")
 
-		track_ids = request.ids[:200]
-		results = await spotify_api.get_tracks(track_ids)
+        track_ids = request.ids[:200]
+        results = await spotify_api.get_tracks(track_ids, official=request.official)  # Add official parameter
 
-		# Convert to array and filter out None values
-		valid_results = [
-				data
-				for data in results.values()
-				if data is not None
-				]
+        # Convert to array and filter out None values
+        valid_results = [
+            data
+            for data in results.values()
+            if data is not None
+        ]
 
-		if not valid_results:
-			raise HTTPException(status_code=404, detail="No valid tracks found")
+        if not valid_results:
+            raise HTTPException(status_code=404, detail="No valid tracks found")
 
-		return valid_results
+        return valid_results
 
-	except Exception as e:
-		logger.error(f"Error fetching tracks: {e}")
-		raise HTTPException(status_code=500, detail="Internal server error")
+    except Exception as e:
+        logger.error(f"Error fetching tracks: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
