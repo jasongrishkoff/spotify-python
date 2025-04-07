@@ -437,7 +437,7 @@ class ArtistRequest(BaseModel):
     ids: List[str]
     detail: Optional[bool] = Field(default=False)
     official: Optional[bool] = Field(default=False)
-    with_tracks: Optional[bool] = Field(default=False)  # Add this field
+    top_tracks: Optional[bool] = Field(default=False)  # Add new parameter
 
     class Config:
         extra = "forbid"
@@ -447,16 +447,24 @@ class ArtistRequest(BaseModel):
 async def get_artist(
         artist_id: str,
         detail: bool = False,
-        official: bool = False  # New parameter
+        official: bool = False,
+        top_tracks: bool = False  # New parameter
         ):
     """
     Get a single artist by ID.
     Use official=true to use Spotify's public API instead of partner API.
-    Optionally return detailed data when detail=true
+    Optionally return detailed data when detail=true.
+    Include top tracks when top_tracks=true.
     """
     try:
         # First try to get the artist
-        results = await spotify_api.get_artists([artist_id], skip_cache=True, detail=detail, official=official)
+        results = await spotify_api.get_artists(
+            [artist_id], 
+            skip_cache=True, 
+            detail=detail, 
+            official=official,
+            top_tracks=top_tracks  # Pass new parameter
+        )
 
         if not results:
             logger.warning(f"No results returned for artist {artist_id}")
@@ -489,20 +497,18 @@ async def get_artist(
 @app.post("/api/artists")
 async def get_artists(request: ArtistRequest):
     """Get multiple artists by their IDs.
-    Optionally return detailed data or use official Spotify API."""
+    Optionally return detailed data, use official Spotify API, or include top tracks."""
     try:
         if not request.ids:
             raise HTTPException(status_code=400, detail="No artist IDs provided")
-
-        # Debug the parsed request
-        #logger.info("Parsed request model: %s", request.dict())
 
         artist_ids = request.ids[:200]
 
         results = await spotify_api.get_artists(
             artist_ids,
             detail=request.detail,
-            official=request.official
+            official=request.official,
+            top_tracks=request.top_tracks  # Pass new parameter
         )
 
         # Convert to array and filter out None values

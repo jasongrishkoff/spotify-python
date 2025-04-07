@@ -1220,13 +1220,16 @@ class SpotifyAPI:
             artist_ids: List[str],
             skip_cache: bool = False,
             detail: bool = False,
-            official: bool = False
+            official: bool = False,
+            top_tracks: bool = False  # New parameter
             ) -> Dict[str, Optional[Dict]]:
         await self._ensure_initialized()
         unique_ids = list(dict.fromkeys(artist_ids))
 
         # Add prefix to IDs for cache lookup
         prefix = "official_" if official else "partner_"
+        if top_tracks:
+            prefix += "top_tracks_"  # Add top_tracks to cache key
         cache_ids = [f"{prefix}{aid}" for aid in unique_ids]
 
         if skip_cache:
@@ -1245,6 +1248,13 @@ class SpotifyAPI:
                     if formatted:
                         artist_id = unique_ids[i]
                         cache_id = f"{prefix}{artist_id}"
+                        
+                        # Fetch top tracks if requested
+                        if top_tracks:
+                            top_tracks_data = await self._fetch_artist_top_tracks(artist_id)
+                            if top_tracks_data and 'tracks' in top_tracks_data:
+                                formatted['top_tracks'] = top_tracks_data['tracks']
+                        
                         valid_artists.append((cache_id, formatted))
                         formatted_results[artist_id] = formatted
 
@@ -1278,6 +1288,13 @@ class SpotifyAPI:
                     if formatted:
                         artist_id = to_fetch[i]
                         cache_id = f"{prefix}{artist_id}"
+                        
+                        # Fetch top tracks if requested
+                        if top_tracks:
+                            top_tracks_data = await self._fetch_artist_top_tracks(artist_id)
+                            if top_tracks_data and 'tracks' in top_tracks_data:
+                                formatted['top_tracks'] = top_tracks_data['tracks']
+                        
                         valid_artists.append((cache_id, formatted))
                         cached_artists[cache_id] = formatted
 
@@ -2098,6 +2115,55 @@ class SpotifyAPI:
 
         except Exception as e:
             logger.error(f"Error fetching track {track_id} from official API: {e}")
+            return None
+        finally:
+            self.rate_limiter.release()
+
+    async def _fetch_artist_top_tracks(self, artist_id: str) -> Optional[Dict]:
+        """Fetch top tracks for an artist using Spotify's public API"""
+        try:
+            await self.rate_limiter.acquire()
+
+            if not await self._ensure_auth('artist'):
+                logger.error("Failed to get auth token for top tracks")
+                return None
+
+            if not self.session:
+                self.session = aiohttp.ClientSession()
+
+            if not self.proxy:
+                logger.debug("No proxy available")
+                return None
+
+            # Add the market parameter to get tracks that are available in the US
+            url = f"https://api.spotify.com/v1/artists/{artist_id}/top-tracks?market=US"
+
+            # Add client token to headers if available
+            headers = {'Authorization': f'Bearer {self.access_token}'}
+            if hasattr(self, 'client_token') and self.client_token:
+                headers['client-token'] = self.client_token
+
+            async with self.session.get(
+                    url,
+                    headers=headers,
+                    proxy=self.proxy.url,
+                    proxy_auth=self.proxy.auth,
+                    timeout=10
+                    ) as response:
+                if response.status == 200:
+                    return await response.json()
+                elif response.status in {401, 407}:
+                    logger.error(f"Authorization error {response.status}")
+                    self.access_token = None
+                    self.client_token = None
+                    self.proxy = None
+                    return None
+
+                logger.warning(f"Failed to fetch top tracks for artist {artist_id}: {response.status}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error fetching top tracks for artist {artist_id}: {e}")
             return None
         finally:
             self.rate_limiter.release()
