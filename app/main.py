@@ -437,10 +437,10 @@ class ArtistRequest(BaseModel):
     ids: List[str]
     detail: Optional[bool] = Field(default=False)
     official: Optional[bool] = Field(default=False)
-    top_tracks: Optional[bool] = Field(default=False)  # Add new parameter
+    top_tracks: Optional[bool] = Field(default=False)  # Only keep this parameter
 
     class Config:
-        extra = "forbid"
+        extra = "allow"  # Change from "forbid" to "allow" to accept extra fields
         validate_assignment = True
 
 @app.get("/api/artist/{artist_id}")
