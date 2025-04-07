@@ -437,7 +437,6 @@ class ArtistRequest(BaseModel):
     ids: List[str]
     detail: Optional[bool] = Field(default=False)
     official: Optional[bool] = Field(default=False)
-    with_tracks: Optional[bool] = Field(default=False)  # Maintain existing parameter
     top_tracks: Optional[bool] = Field(default=False)  # Add new parameter
 
     class Config:
@@ -510,7 +509,6 @@ async def get_artists(request: ArtistRequest):
             detail=request.detail,
             official=request.official,
             top_tracks=request.top_tracks,  # Pass new parameter
-            with_tracks=request.with_tracks  # Pass existing parameter
         )
 
         # Convert to array and filter out None values
