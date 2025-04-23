@@ -28,7 +28,7 @@ class RedisCache:
             'discovered': 'spotify_discovered_hash_lock'
         }
         # Add a global semaphore to limit Redis operations
-        self._semaphore = asyncio.Semaphore(5)
+        self._semaphore = asyncio.Semaphore(15)
         
     async def get_token(self, token_type: str = 'playlist', backup_index: int = 0) -> Optional[Dict]:
         """
