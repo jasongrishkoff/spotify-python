@@ -1714,7 +1714,6 @@ class SpotifyAPI:
             return False, None
 
     async def _get_discovered_hash(self) -> Optional[str]:
-        """Get the discovered-on hash using a simpler approach with lower resource usage"""
         logger.info("Getting discovered-on hash from live request")
         
         try:
@@ -1787,6 +1786,12 @@ class SpotifyAPI:
                     
                     # Extract captured requests from JavaScript
                     captured_requests = await page.evaluate("window.requests")
+                    
+                    # Check if captured_requests is None before using len()
+                    if captured_requests is None:
+                        logger.warning("No requests captured, returning fallback hash")
+                        return self.fallback_hashes.get('queryArtistDiscoveredOn')
+                        
                     logger.info(f"Captured {len(captured_requests)} requests")
                     
                     # Process captured requests
@@ -1814,14 +1819,15 @@ class SpotifyAPI:
                 await self.cache.save_discovered_hash(discovered_hash)
                 return discovered_hash
             else:
-                logger.warning("No discovered hash found in requests")
-                return None
+                logger.warning("No discovered hash found in requests, using fallback")
+                return self.fallback_hashes.get('queryArtistDiscoveredOn')
                 
         except Exception as e:
             logger.error(f"Error in hash capture: {e}")
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
-            return None
+            # Return the fallback hash on error
+            return self.fallback_hashes.get('queryArtistDiscoveredOn')
 
     async def _ensure_discovered_hash(self) -> Optional[str]:
         """Ensures we have a valid discovered-on hash with fallback logic"""
@@ -1833,7 +1839,7 @@ class SpotifyAPI:
         current_time = time.time()
         if hasattr(self, '_last_hash_capture_attempt') and current_time - self._last_hash_capture_attempt < 300:
             # Don't try again too soon (5 minute cooldown)
-            logger.info("Using fallback discovered-on hash (capture cooldown active)")
+            #logger.info("Using fallback discovered-on hash (capture cooldown active)")
             return self.fallback_hashes.get('queryArtistDiscoveredOn')
         
         # Track this attempt
