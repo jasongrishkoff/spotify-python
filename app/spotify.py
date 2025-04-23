@@ -1714,7 +1714,7 @@ class SpotifyAPI:
             return False, None
 
     async def _get_discovered_hash(self) -> Optional[str]:
-        """Get the discovered-on hash by monitoring actual Spotify web requests"""
+        """Get the discovered-on hash using a simpler approach with lower resource usage"""
         logger.info("Getting discovered-on hash from live request")
         
         try:
@@ -1725,158 +1725,139 @@ class SpotifyAPI:
                     return None
 
             from playwright.async_api import async_playwright
-            import urllib.parse
             
-            # Use a separate variable for the browser to avoid context issues
             discovered_hash = None
             
-            try:
-                async with async_playwright() as p:
-                    browser = await p.chromium.launch(
-                        proxy=self.proxy.to_playwright_config() if self.proxy else None,
-                        headless=True,
-                        args=[
-                            '--no-sandbox',
-                            '--disable-dev-shm-usage',
-                            '--disable-gpu',
-                        ]
-                    )
-                    
-                    # Create a new context explicitly
+            async with async_playwright() as p:
+                # Use minimal browser settings
+                browser = await p.chromium.launch(
+                    proxy=self.proxy.to_playwright_config() if self.proxy else None,
+                    headless=True,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-gpu',
+                        '--mute-audio'
+                    ]
+                )
+                
+                try:
+                    # Create a context
                     context = await browser.new_context(
-                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
-                        viewport={"width": 1280, "height": 800},
-                        locale="en-US",
-                        timezone_id="America/New_York",
-                        permissions=["geolocation"],
-                        java_script_enabled=True,
-                        bypass_csp=True
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
                     )
                     
-                    # Create a page with custom debug features
+                    # Create a page without request interception (which is causing errors)
                     page = await context.new_page()
                     
-                    # Add a JavaScript snippet to intercept XHR/fetch requests including bodies
+                    # Enable request logging via JavaScript instead
                     await page.evaluate("""
                     () => {
                         window.requests = [];
                         const originalFetch = window.fetch;
                         window.fetch = async function(url, options) {
-                            const request = {
-                                url,
-                                method: options?.method || 'GET',
-                                headers: options?.headers || {},
-                                body: options?.body
-                            };
-                            window.requests.push(request);
+                            try {
+                                if (options && options.method === 'POST' && url.includes('pathfinder/v2/query')) {
+                                    window.requests.push({
+                                        url: url,
+                                        method: options.method,
+                                        body: options.body
+                                    });
+                                }
+                            } catch (e) {
+                                console.error('Error capturing request:', e);
+                            }
                             return originalFetch.apply(this, arguments);
                         };
                     }
                     """)
                     
-                    # Visit an artist's discovered-on page
-                    artist_id = "3GBPw9NK25X1Wt2OUvOwY3"  # A reliable artist ID to test with
+                    # Navigate to artist page
+                    artist_id = "3GBPw9NK25X1Wt2OUvOwY3"  # A reliable artist ID
                     logger.info(f"Navigating to artist {artist_id} discovered-on page")
                     
-                    try:
-                        await page.goto(f'https://open.spotify.com/artist/{artist_id}/discovered-on', 
-                                       timeout=30000, wait_until='domcontentloaded')
-                        
-                        # Wait for content to load
-                        await page.wait_for_load_state('networkidle', timeout=10000)
-                        
-                        # Let JavaScript run a bit longer
-                        await asyncio.sleep(3)
-                        
-                        # Extract requests from our custom JavaScript
-                        captured_requests = await page.evaluate("window.requests")
-                        logger.info(f"Captured {len(captured_requests)} requests")
-                        
-                        # Look for discovered-on requests
-                        for req in captured_requests:
-                            if '/pathfinder/v2/query' in req.get('url', '') and 'queryArtistDiscoveredOn' in str(req.get('body', '')):
-                                try:
-                                    body = req.get('body')
-                                    if body:
-                                        # Parse JSON body
-                                        body_data = json.loads(body)
-                                        hash_value = body_data.get('extensions', {}).get('persistedQuery', {}).get('sha256Hash')
-                                        if hash_value:
-                                            discovered_hash = hash_value
-                                            logger.info(f"Found discovered hash from POST body: {discovered_hash}")
-                                            break
-                                except Exception as e:
-                                    logger.warning(f"Error parsing request body: {e}")
-                        
-                        # If no hash found via JS capture, try network interception as backup
-                        if not discovered_hash:
-                            # Setup network interception
-                            requests_collector = []
-                            
-                            async def intercept_request(intercepted_request):
-                                requests_collector.append(intercepted_request)
-                                await intercepted_request.continue_()
-                            
-                            await page.route("**/*", intercept_request)
-                            
-                            # Reload the page to capture with interception
-                            await page.reload(timeout=30000, wait_until='domcontentloaded')
-                            await page.wait_for_load_state('networkidle', timeout=10000)
-                            
-                            # Process intercepted requests
-                            for request in requests_collector:
-                                if '/pathfinder/v2/query' in request.url and request.method == 'POST':
-                                    try:
-                                        post_data = request.post_data
-                                        if post_data and 'queryArtistDiscoveredOn' in post_data:
-                                            data = json.loads(post_data)
-                                            hash_value = data.get('extensions', {}).get('persistedQuery', {}).get('sha256Hash')
-                                            if hash_value:
-                                                discovered_hash = hash_value
-                                                logger.info(f"Found discovered hash from intercepted request: {discovered_hash}")
-                                                break
-                                    except Exception as e:
-                                        logger.warning(f"Error processing intercepted request: {e}")
+                    await page.goto(
+                        f'https://open.spotify.com/artist/{artist_id}/discovered-on', 
+                        timeout=15000,
+                        wait_until='domcontentloaded'
+                    )
                     
-                    except Exception as e:
-                        logger.error(f"Error navigating to artist page: {e}")
+                    # Wait for content to load
+                    await asyncio.sleep(5)
                     
-                    # Clean up
+                    # Extract captured requests from JavaScript
+                    captured_requests = await page.evaluate("window.requests")
+                    logger.info(f"Captured {len(captured_requests)} requests")
+                    
+                    # Process captured requests
+                    for req in captured_requests:
+                        if req.get('body') and 'queryArtistDiscoveredOn' in req.get('body', ''):
+                            try:
+                                body_data = json.loads(req['body'])
+                                hash_value = body_data.get('extensions', {}).get('persistedQuery', {}).get('sha256Hash')
+                                if hash_value:
+                                    discovered_hash = hash_value
+                                    logger.info(f"Found discovered hash: {discovered_hash}")
+                                    break
+                            except Exception as e:
+                                logger.debug(f"Error parsing request body: {e}")
+                
+                finally:
+                    # Clean up resources
                     try:
-                        await page.close()
-                        await context.close()
                         await browser.close()
                     except Exception as e:
-                        logger.warning(f"Error during browser cleanup: {e}")
-
-                    # If we found a hash, save it
-                    if discovered_hash:
-                        await self.cache.save_discovered_hash(discovered_hash)
-                        return discovered_hash
-                    else:
-                        logger.warning("No discovered hash found in any requests")
-                        return None
-                        
-            except Exception as e:
-                logger.error(f"Error in browser automation: {e}")
-                import traceback
-                logger.error(f"Traceback: {traceback.format_exc()}")
+                        logger.warning(f"Error closing browser: {e}")
+            
+            # If we found a hash, save it
+            if discovered_hash:
+                await self.cache.save_discovered_hash(discovered_hash)
+                return discovered_hash
+            else:
+                logger.warning("No discovered hash found in requests")
                 return None
-
+                
         except Exception as e:
-            logger.error(f"Error getting discovered-on hash: {e}")
+            logger.error(f"Error in hash capture: {e}")
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
             return None
 
     async def _ensure_discovered_hash(self) -> Optional[str]:
-        """Ensures we have a valid discovered-on hash"""
-        # Try cache first
+        """Ensures we have a valid discovered-on hash with fallback logic"""
+        # First try to get from cache
         if discovered_hash := await self.cache.get_discovered_hash():
             return discovered_hash
         
-        # Skip dynamic capture and use fallback immediately
-        return '71c2392e4cecf6b48b9ad1311ae08838cbdabcfd189c6bf0c66c2430b8dcfdb1'
+        # Set up circuit breaker to prevent repeated capture attempts
+        current_time = time.time()
+        if hasattr(self, '_last_hash_capture_attempt') and current_time - self._last_hash_capture_attempt < 300:
+            # Don't try again too soon (5 minute cooldown)
+            logger.info("Using fallback discovered-on hash (capture cooldown active)")
+            return self.fallback_hashes.get('queryArtistDiscoveredOn')
+        
+        # Track this attempt
+        self._last_hash_capture_attempt = current_time
+        
+        # Try to dynamically capture hash, but with a timeout
+        try:
+            # Set a timeout for the entire capture operation
+            hash_value = await asyncio.wait_for(
+                self._get_discovered_hash(),
+                timeout=30  # Maximum 30 seconds for the entire operation
+            )
+            
+            if hash_value:
+                logger.info(f"Successfully captured new discovered hash: {hash_value}")
+                return hash_value
+        except asyncio.TimeoutError:
+            logger.warning("Hash capture timed out")
+        except Exception as e:
+            logger.warning(f"Hash capture failed: {e}")
+        
+        # Use fallback hash as last resort
+        logger.info("Using fallback discovered-on hash")
+        return self.fallback_hashes.get('queryArtistDiscoveredOn')
 
     @staticmethod
     def _format_discovered_on(data: Dict) -> Optional[Dict]:

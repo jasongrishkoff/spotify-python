@@ -13,9 +13,10 @@ logger = logging.getLogger(__name__)
 class AsyncDatabase:
     def __init__(self, path: str = 'spotify_cache.db'):
         self.path = path
-        self.pool_size = 10
-        self._init_done = False  # Flag to track initialization
+        self._init_done = False
         self._cleanup_lock = asyncio.Lock()
+        self.max_connection_retries = 5
+        self.connection_retry_delay = 0.5  # seconds
         
     async def _init_db(self):
         """Initialize database tables if they don't exist"""
