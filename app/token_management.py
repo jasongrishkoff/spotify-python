@@ -673,6 +673,13 @@ class SpotifyAPIEnhanced(SpotifyAPI):
     def __init__(self, db_path: str = 'spotify_cache.db'):
         super().__init__(db_path)
         self._logger = logging.getLogger(__name__)
+
+        self.fallback_hashes = {
+            'fetchPlaylist': '73e52a247676fae953856747dd7f43a19383f1969e970a2c6d31393d2b35187e',
+            'queryArtistOverview': '4bc52527bb77a5f8bbb9afe491e9aa725698d29ab73bff58d49169ee29800167',
+            'getTrack': '26cd58ab86ebba80196c41c3d48a4324c619e9a9d7df26ecca22417e0c50c6a4',
+            'queryArtistDiscoveredOn': '71c2392e4cecf6b48b9ad1311ae08838cbdabcfd189c6bf0c66c2430b8dcfdb1'
+        }
         
     @property
     def logger(self):

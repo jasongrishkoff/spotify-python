@@ -515,7 +515,7 @@ class TokenWorker:
     async def _capture_tokens(self, proxy: ProxyConfig):
         """
         Capture Spotify tokens and operation hashes using browser automation.
-        Extracted and simplified from SpotifyAPI class.
+        Updated to handle v2 API and POST requests.
         """
         from playwright.async_api import async_playwright
         
@@ -558,7 +558,7 @@ class TokenWorker:
                 try:
                     # Create context with credible user agent
                     context = await browser.new_context(
-                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
                         viewport={"width": 1280, "height": 800},
                         locale="en-US",
                         timezone_id="America/New_York",
@@ -568,7 +568,7 @@ class TokenWorker:
                     
                     page = await context.new_page()
                     
-                    # Set up network request interceptor
+                    # Set up network request interceptor that handles both v1 and v2 APIs
                     async def intercept_request(route):
                         nonlocal access_token, client_token, operation_hashes
                         request = route.request
@@ -592,10 +592,10 @@ class TokenWorker:
                                     client_token = current_client_token
                                     logger.info(f"Found client token: {client_token[:15]}...")
                             
-                            # Extract GraphQL operation hashes from URL
+                            # Extract GraphQL operation hashes from both GET and POST requests
                             try:
+                                # For v1 API (GET requests with URL parameters)
                                 if "operationName=" in url and "extensions=" in url:
-                                    # Parse URL to get operationName
                                     import urllib.parse
                                     parsed_url = urllib.parse.urlparse(url)
                                     query_params = urllib.parse.parse_qs(parsed_url.query)
@@ -620,6 +620,28 @@ class TokenWorker:
                                                         logger.info(f"Found hash for {operation_name}: {hash_value[:10]}...")
                                                 except json.JSONDecodeError:
                                                     pass
+                                
+                                # For v2 API (POST requests with JSON body)
+                                elif request.method == "POST" and "/pathfinder/v2/query" in url:
+                                    post_data = request.post_data
+                                    if post_data:
+                                        try:
+                                            data = json.loads(post_data)
+                                            operation_name = data.get('operationName')
+                                            
+                                            if operation_name in operations_to_capture:
+                                                operations_seen.add(operation_name)
+                                                
+                                                # Extract hash from extensions
+                                                extensions = data.get('extensions', {})
+                                                if extensions and 'persistedQuery' in extensions:
+                                                    hash_value = extensions['persistedQuery'].get('sha256Hash')
+                                                    if hash_value:
+                                                        # Store the hash for this operation
+                                                        operation_hashes[operation_name] = hash_value
+                                                        logger.info(f"Found hash for {operation_name} from POST: {hash_value[:10]}...")
+                                        except json.JSONDecodeError:
+                                            pass
                             except Exception as hash_e:
                                 logger.error(f"Error extracting hash: {hash_e}")
                             
@@ -697,7 +719,7 @@ class TokenWorker:
             logger.error(f"Error in token capture: {e}", exc_info=True)
         
         return access_token, client_token, operation_hashes
-    
+
     async def _refresh_graphql_hashes(self):
         """Refresh GraphQL operation hashes"""
         logger.info("Refreshing GraphQL operation hashes")
@@ -751,7 +773,7 @@ class TokenWorker:
             await self.redis_cache.release_lock('discovered')
     
     async def _capture_discovered_hash(self, proxy: ProxyConfig) -> Optional[str]:
-        """Capture the discovered-on hash using browser automation"""
+        """Capture the discovered-on hash using browser automation, updated for v2 API"""
         from playwright.async_api import async_playwright
         
         logger.info("Starting discovered hash capture")
@@ -766,7 +788,9 @@ class TokenWorker:
                 )
                 
                 try:
-                    context = await browser.new_context()
+                    context = await browser.new_context(
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+                    )
                     page = await context.new_page()
                     
                     hash_event = asyncio.Event()
@@ -774,25 +798,47 @@ class TokenWorker:
                     async def handle_request(route):
                         nonlocal discovered_hash
                         request = route.request
+                        
+                        # Check for discovered-on requests in both v1 and v2 paths
                         if 'queryArtistDiscoveredOn' in request.url:
-                            logger.info(f"Found queryArtistDiscoveredOn request")
-                            try:
-                                import urllib.parse
-                                parsed_url = urllib.parse.urlparse(request.url)
-                                query_params = urllib.parse.parse_qs(parsed_url.query)
-                                
-                                if 'extensions' in query_params:
-                                    extensions_str = query_params['extensions'][0]
-                                    try:
-                                        extensions = json.loads(urllib.parse.unquote(extensions_str))
-                                        if extensions.get('persistedQuery', {}).get('sha256Hash'):
-                                            discovered_hash = extensions['persistedQuery']['sha256Hash']
-                                            logger.info(f"Found discovered hash: {discovered_hash[:10]}...")
-                                            hash_event.set()
-                                    except json.JSONDecodeError:
-                                        pass
-                            except Exception as e:
-                                logger.error(f"Error parsing URL: {e}")
+                            logger.info(f"Found queryArtistDiscoveredOn request via {request.method}")
+                            
+                            # Handle POST requests (v2 API)
+                            if request.method == 'POST':
+                                try:
+                                    post_data = request.post_data
+                                    if post_data:
+                                        try:
+                                            data = json.loads(post_data)
+                                            if data.get('extensions', {}).get('persistedQuery', {}).get('sha256Hash'):
+                                                discovered_hash = data['extensions']['persistedQuery']['sha256Hash']
+                                                logger.info(f"Found discovered hash from POST body: {discovered_hash}")
+                                                hash_event.set()
+                                        except json.JSONDecodeError:
+                                            pass
+                                except Exception as e:
+                                    logger.error(f"Error parsing POST body: {e}")
+                            
+                            # Handle GET requests (v1 API)
+                            else:
+                                try:
+                                    import urllib.parse
+                                    parsed_url = urllib.parse.urlparse(request.url)
+                                    query_params = urllib.parse.parse_qs(parsed_url.query)
+                                    
+                                    if 'extensions' in query_params:
+                                        extensions_str = query_params['extensions'][0]
+                                        try:
+                                            extensions = json.loads(urllib.parse.unquote(extensions_str))
+                                            if extensions.get('persistedQuery', {}).get('sha256Hash'):
+                                                discovered_hash = extensions['persistedQuery']['sha256Hash']
+                                                logger.info(f"Found discovered hash from URL: {discovered_hash}")
+                                                hash_event.set()
+                                        except json.JSONDecodeError:
+                                            pass
+                                except Exception as e:
+                                    logger.error(f"Error parsing URL: {e}")
+                        
                         await route.continue_()
                     
                     # Listen to network requests
@@ -815,9 +861,9 @@ class TokenWorker:
             logger.error(f"Error capturing discovered hash: {e}", exc_info=True)
         
         return discovered_hash
-    
+
     async def _test_discovered_hash(self) -> bool:
-        """Test if the current discovered hash is valid"""
+        """Test if the current discovered hash is valid with support for v2 API"""
         try:
             discovered_hash = await self.redis_cache.get_discovered_hash()
             if not discovered_hash:
@@ -837,22 +883,24 @@ class TokenWorker:
                 # Test artist ID
                 artist_id = "3GBPw9NK25X1Wt2OUvOwY3"
                 
-                url = "https://api-partner.spotify.com/pathfinder/v1/query"
+                # Try v2 endpoint first
+                url = "https://api-partner.spotify.com/pathfinder/v2/query"
                 
                 variables = {
                     'uri': f'spotify:artist:{artist_id}',
                     'locale': ''
                 }
                 
-                params = {
+                # Create payload for POST request
+                payload = {
                     'operationName': 'queryArtistDiscoveredOn',
-                    'variables': json.dumps(variables),
-                    'extensions': json.dumps({
+                    'variables': variables,
+                    'extensions': {
                         'persistedQuery': {
                             'version': 1,
                             'sha256Hash': discovered_hash
                         }
-                    })
+                    }
                 }
                 
                 headers = {
@@ -865,9 +913,10 @@ class TokenWorker:
                 if client_token:
                     headers['client-token'] = client_token
                 
-                async with self.session.get(
+                # Use POST request for v2 API
+                async with self.session.post(
                     url,
-                    params=params,
+                    json=payload,
                     headers=headers,
                     proxy=proxy.url,
                     proxy_auth=proxy.auth,
@@ -881,6 +930,38 @@ class TokenWorker:
                             return False
                         return True
                     
+                    # If v2 fails, try v1 as fallback
+                    if response.status != 200:
+                        logger.warning(f"v2 API test failed with status {response.status}, trying v1 as fallback")
+                        
+                        # Use the old v1 endpoint with GET request
+                        v1_url = "https://api-partner.spotify.com/pathfinder/v1/query"
+                        
+                        v1_params = {
+                            'operationName': 'queryArtistDiscoveredOn',
+                            'variables': json.dumps(variables),
+                            'extensions': json.dumps({
+                                'persistedQuery': {
+                                    'version': 1,
+                                    'sha256Hash': discovered_hash
+                                }
+                            })
+                        }
+                        
+                        async with self.session.get(
+                            v1_url,
+                            params=v1_params,
+                            headers=headers,
+                            proxy=proxy.url,
+                            proxy_auth=proxy.auth,
+                            timeout=10
+                        ) as v1_response:
+                            if v1_response.status == 200:
+                                v1_data = await v1_response.json()
+                                if 'errors' not in v1_data:
+                                    logger.info("v1 API test succeeded")
+                                    return True
+                    
                     logger.warning(f"Discovered hash test failed with status {response.status}")
                     return False
             
@@ -889,7 +970,7 @@ class TokenWorker:
         except Exception as e:
             logger.error(f"Error testing discovered hash: {e}")
             return False
-    
+ 
     async def _save_graphql_hash(self, operation_name: str, hash_value: str):
         """Save a GraphQL operation hash to Redis"""
         try:

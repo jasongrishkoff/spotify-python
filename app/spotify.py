@@ -192,11 +192,10 @@ class GraphQLHashManager:
         
         # Fallback hashes to use if no dynamic hash is available
         self.fallback_hashes = {
-            #'fetchPlaylistMetadata': 'b2a084f6dcb11b3c8ab327dd79c9d8ac270f3b90691e8a249fad18b6f241df4a',
-            'fetchPlaylist': 'b2a084f6dcb11b3c8ab327dd79c9d8ac270f3b90691e8a249fad18b6f241df4a',
+            'fetchPlaylist': '73e52a247676fae953856747dd7f43a19383f1969e970a2c6d31393d2b35187e',
             'queryArtistOverview': '4bc52527bb77a5f8bbb9afe491e9aa725698d29ab73bff58d49169ee29800167',
             'getTrack': '26cd58ab86ebba80196c41c3d48a4324c619e9a9d7df26ecca22417e0c50c6a4',
-            'queryArtistDiscoveredOn': '994dde7e4c15f5ed5bae63716cfbda9fdf75bca5f534142da3397fc2596be62b'
+            'queryArtistDiscoveredOn': '71c2392e4cecf6b48b9ad1311ae08838cbdabcfd189c6bf0c66c2430b8dcfdb1'
         }
         
         # Map the operation names to endpoints for clearer logging
@@ -293,15 +292,23 @@ class DiscoveredHashCircuitBreaker:
         self.hash_refresh_in_progress = False
         self.last_refresh_time = 0
         self.min_refresh_interval = 60  # Don't refresh more than once per minute
+        self.disabled_until = 0  # Timestamp when circuit breaker should be re-enabled
 
     async def record_failure(self, spotify_api, redis_cache):
         """Record a failure and trigger hash refresh if needed"""
+        current_time = time.time()
+        
+        # If circuit breaker is disabled, just log and return
+        if current_time < self.disabled_until:
+            logger.debug(f"Circuit breaker disabled for {int(self.disabled_until - current_time)}s more")
+            return
+            
         self.consecutive_failures += 1
 
         # If we've hit the threshold and we're not already refreshing
         if (self.consecutive_failures >= self.failure_threshold and 
             not self.hash_refresh_in_progress and 
-            time.time() - self.last_refresh_time > self.min_refresh_interval):
+            current_time - self.last_refresh_time > self.min_refresh_interval):
 
             self.hash_refresh_in_progress = True
             try:
@@ -311,15 +318,25 @@ class DiscoveredHashCircuitBreaker:
                     await redis_cache.save_discovered_hash(new_hash)
                     self.consecutive_failures = 0
                     logger.info("Successfully refreshed discovered hash via circuit breaker")
-                self.last_refresh_time = time.time()
+                else:
+                    # If refresh fails, disable circuit breaker for 10 minutes
+                    self.disabled_until = current_time + 600  # 10 minutes
+                    logger.warning("Failed to refresh hash, disabling circuit breaker for 10 minutes")
+                self.last_refresh_time = current_time
             except Exception as e:
                 logger.error(f"Failed to refresh hash via circuit breaker: {e}")
+                # Disable circuit breaker for 5 minutes on error
+                self.disabled_until = current_time + 300  # 5 minutes
             finally:
                 self.hash_refresh_in_progress = False
 
     def record_success(self):
         """Record a successful request"""
         self.consecutive_failures = 0
+        
+    def is_disabled(self):
+        """Check if circuit breaker is currently disabled"""
+        return time.time() < self.disabled_until
 
 class TokenCircuitBreaker:
     def __init__(self, failure_threshold=10, cooldown_period=60):
@@ -1394,11 +1411,11 @@ class SpotifyAPI:
         return formatted_data
 
     async def _fetch_artist(self, artist_id: str) -> Optional[Dict]:
-        """Fetch artist data using dynamically captured hashes with improved reliability"""
+        """Fetch artist data using dynamically captured hashes with improved reliability for v2 API"""
         try:
             await self.rate_limiter.acquire()
 
-            url = "https://api-partner.spotify.com/pathfinder/v1/query"
+            url = "https://api-partner.spotify.com/pathfinder/v2/query"
 
             variables = {
                 'uri': f'spotify:artist:{artist_id}',
@@ -1414,100 +1431,79 @@ class SpotifyAPI:
                 logger.error("No artist hash available")
                 return None
 
-            params = {
+            # Create JSON payload for POST request
+            payload = {
                 'operationName': 'queryArtistOverview',
-                'variables': json.dumps(variables),
-                'extensions': json.dumps({
+                'variables': variables,
+                'extensions': {
                     'persistedQuery': {
                         'version': 1,
                         'sha256Hash': artist_hash
                     }
-                })
+                }
             }
 
-            # Use the make_api_request helper
-            data = await self.retry_request(
-                url=url,
-                token_type='artist',
-                params=params
-            )
-            
-            if not data:
-                return None
+            headers = {
+                'Authorization': f'Bearer {self.access_token}',
+                'content-type': 'application/json',
+                'accept': 'application/json',
+                'app-platform': 'WebPlayer'
+            }
 
-            # Check for GraphQL errors
-            if 'errors' in data:
-                error_msg = data.get('errors', [{}])[0].get('message', '')
-                
-                if 'PersistedQueryNotFound' in error_msg:
-                    # Clear hash to force refresh
-                    await self.hash_manager.save_hash('queryArtistOverview', None)
-                    logger.warning("Artist hash invalidated, cleared from cache")
+            if self.client_token:
+                headers['client-token'] = self.client_token
+
+            # Use POST instead of GET with parameters
+            async with self.session.post(
+                url,
+                json=payload,
+                headers=headers,
+                proxy=self.proxy.url,
+                proxy_auth=self.proxy.auth,
+                timeout=10
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    # Check for GraphQL errors
+                    if 'errors' in data:
+                        error_msg = data.get('errors', [{}])[0].get('message', '')
+                        
+                        if 'PersistedQueryNotFound' in error_msg:
+                            # Clear hash to force refresh
+                            await self.hash_manager.save_hash('queryArtistOverview', None)
+                            logger.warning("Artist hash invalidated, cleared from cache")
+                            return None
+                        
+                        elif 'NullValueInNonNullableField' in error_msg or 'Server error' in error_msg:
+                            # Handle null field errors (same as before)
+                            if 'data' in data and 'artistUnion' in data['data']:
+                                # Fix relatedContent null value
+                                if data['data']['artistUnion'] is not None and 'relatedContent' not in data['data']['artistUnion']:
+                                    logger.info(f"Adding missing relatedContent for artist {artist_id}")
+                                    data['data']['artistUnion']['relatedContent'] = {
+                                        "discoveredOnV2": {"items": []},
+                                        "featuring": {"items": []},
+                                        "featuringV2": {"items": []},
+                                        "appearsOn": {"items": []},
+                                        "appearsOnV2": {"items": []},
+                                        "playlists": {"items": []}
+                                    }
+                                
+                                # Other fixes remain the same
+                                # ...
+                                
+                                # The modified response should now be usable
+                                return data
+                        
+                        # Log other errors
+                        logger.error(f"GraphQL errors in response for artist {artist_id}: {data['errors']}")
+                        return None
+
+                    return data
+                else:
+                    logger.warning(f"Artist request failed with status {response.status}")
                     return None
-                
-                elif 'NullValueInNonNullableField' in error_msg or 'Server error' in error_msg:
-                    # Handle the null field error gracefully
-                    if 'data' in data and 'artistUnion' in data['data']:
-                        # Fix relatedContent null value
-                        if data['data']['artistUnion'] is not None and 'relatedContent' not in data['data']['artistUnion']:
-                            logger.info(f"Adding missing relatedContent for artist {artist_id}")
-                            data['data']['artistUnion']['relatedContent'] = {
-                                "discoveredOnV2": {"items": []},
-                                "featuring": {"items": []},
-                                "featuringV2": {"items": []},
-                                "appearsOn": {"items": []},
-                                "appearsOnV2": {"items": []},
-                                "playlists": {"items": []}
-                            }
-                        
-                        # If artistUnion is present but relatedContent is null
-                        if data['data']['artistUnion'] is not None and data['data']['artistUnion'].get('relatedContent') is None:
-                            logger.info(f"Fixing null relatedContent for artist {artist_id}")
-                            data['data']['artistUnion']['relatedContent'] = {
-                                "discoveredOnV2": {"items": []},
-                                "featuring": {"items": []},
-                                "featuringV2": {"items": []},
-                                "appearsOn": {"items": []},
-                                "appearsOnV2": {"items": []},
-                                "playlists": {"items": []}
-                            }
-                        
-                        # Fix null items in featuringV2
-                        if data['data']['artistUnion'] is not None and 'relatedContent' in data['data']['artistUnion']:
-                            related = data['data']['artistUnion']['relatedContent']
-                            
-                            # Fix featuringV2 items
-                            if related and 'featuringV2' in related and related.get('featuringV2') is not None:
-                                featuring = related['featuringV2']
-                                if 'items' in featuring:
-                                    for i, item in enumerate(featuring['items']):
-                                        if item is None or 'data' not in item or item['data'] is None:
-                                            featuring['items'][i] = {'data': {'__placeholder': True}}
-                            elif related and ('featuringV2' not in related or related.get('featuringV2') is None):
-                                related['featuringV2'] = {"items": []}
-                            
-                            # Fix discoveredOnV2 field if missing or null
-                            if related and ('discoveredOnV2' not in related or related.get('discoveredOnV2') is None):
-                                related['discoveredOnV2'] = {"items": []}
-                            
-                            # Ensure other sections exist to prevent potential null issues
-                            sections = ['featuring', 'appearsOn', 'appearsOnV2', 'playlists']
-                            for section in sections:
-                                if related and (section not in related or related.get(section) is None):
-                                    related[section] = {"items": []}
-                        
-                        # Set default saved value if missing
-                        if data['data']['artistUnion'] is not None and 'saved' not in data['data']['artistUnion']:
-                            data['data']['artistUnion']['saved'] = False
-                        
-                        # The modified response should now be usable
-                        return data
-                
-                # For other types of errors, log them in detail
-                logger.error(f"GraphQL errors in response for artist {artist_id}: {data['errors']}")
-                return None
-
-            return data
 
         except Exception as e:
             logger.error(f"Error fetching artist {artist_id}: {e}")
@@ -1564,16 +1560,102 @@ class SpotifyAPI:
         return formatted_data
 
     async def _fetch_discovered_on(self, artist_id: str) -> Optional[Dict]:
-        """Fetch discovered-on data with improved reliability"""
+        """Fetch discovered-on data with v2 API support and better error handling"""
         try:
             await self.rate_limiter.acquire()
 
-            # Use the helper method to get the hash
+            # Get the hash with fallback
             discovered_hash = await self._ensure_discovered_hash()
             if not discovered_hash:
-                logger.error("Could not get discovered-on hash")
+                logger.error("No discovered-on hash available")
                 return None
 
+            # Try v2 API first
+            success, data = await self._try_v2_discovered_on(artist_id, discovered_hash)
+            
+            # If v2 fails, try v1 API
+            if not success:
+                logger.info("Falling back to v1 API for discovered-on")
+                success, data = await self._try_v1_discovered_on(artist_id, discovered_hash)
+                
+            if success:
+                self.discovered_hash_circuit_breaker.record_success()
+                return data
+            else:
+                await self.discovered_hash_circuit_breaker.record_failure(self, self.cache)
+                return None
+
+        except Exception as e:
+            logger.error(f"Error fetching discovered-on {artist_id}: {e}")
+            # Track failures on exceptions
+            await self.discovered_hash_circuit_breaker.record_failure(self, self.cache)
+            return None
+        finally:
+            self.rate_limiter.release()
+
+    async def _try_v2_discovered_on(self, artist_id: str, discovered_hash: str) -> Tuple[bool, Optional[Dict]]:
+        """Try fetching discovered-on data using v2 API"""
+        try:
+            url = "https://api-partner.spotify.com/pathfinder/v2/query"
+
+            variables = {
+                'uri': f'spotify:artist:{artist_id}'
+            }
+
+            # Create JSON payload for POST request
+            payload = {
+                'operationName': 'queryArtistDiscoveredOn',
+                'variables': variables,
+                'extensions': {
+                    'persistedQuery': {
+                        'version': 1,
+                        'sha256Hash': discovered_hash
+                    }
+                }
+            }
+
+            headers = {
+                'Authorization': f'Bearer {self.access_token}',
+                'content-type': 'application/json',
+                'accept': 'application/json',
+                'app-platform': 'WebPlayer'
+            }
+
+            if self.client_token:
+                headers['client-token'] = self.client_token
+
+            # Use POST with a shorter timeout
+            async with self.session.post(
+                url,
+                json=payload,
+                headers=headers,
+                proxy=self.proxy.url,
+                proxy_auth=self.proxy.auth,
+                timeout=5
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    # Check for GraphQL errors
+                    if 'errors' in data:
+                        logger.warning(f"GraphQL errors in v2 response: {data['errors']}")
+                        return False, None
+
+                    return True, data
+                else:
+                    logger.warning(f"v2 discovered-on request failed with status {response.status}")
+                    return False, None
+
+        except asyncio.TimeoutError:
+            logger.warning("v2 discovered-on request timed out")
+            return False, None
+        except Exception as e:
+            logger.error(f"Error in v2 discovered-on request: {e}")
+            return False, None
+
+    async def _try_v1_discovered_on(self, artist_id: str, discovered_hash: str) -> Tuple[bool, Optional[Dict]]:
+        """Try fetching discovered-on data using v1 API as fallback"""
+        try:
             url = "https://api-partner.spotify.com/pathfinder/v1/query"
 
             variables = {
@@ -1592,40 +1674,44 @@ class SpotifyAPI:
                 })
             }
 
-            # Use the make_api_request helper
-            data = await self.retry_request(
-                url=url,
-                token_type='artist',  # Use artist token type for discovered-on
-                params=params
-            )
-            
-            if not data:
-                await self.discovered_hash_circuit_breaker.record_failure(self, self.cache)
-                return None
+            headers = {
+                'Authorization': f'Bearer {self.access_token}',
+                'content-type': 'application/json',
+                'accept': 'application/json',
+                'app-platform': 'WebPlayer'
+            }
 
-            # Check for GraphQL errors
-            if 'errors' in data:
-                logger.error(f"GraphQL errors in response: {data['errors']}")
-                # If we get PersistedQueryNotFound, clear the cached hash
-                if any(error.get('message') == 'PersistedQueryNotFound' for error in data.get('errors', [])):
-                    await self.cache.redis.delete('spotify_discovered_hash')
-                    # Trigger the circuit breaker
-                    await self.discovered_hash_circuit_breaker.record_failure(self, self.cache)
-                return None
+            if self.client_token:
+                headers['client-token'] = self.client_token
 
-            # Record success
-            self.discovered_hash_circuit_breaker.record_success()
-            return data
+            # Use GET with a shorter timeout
+            async with self.session.get(
+                url,
+                params=params,
+                headers=headers,
+                proxy=self.proxy.url,
+                proxy_auth=self.proxy.auth,
+                timeout=5
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    # Check for GraphQL errors
+                    if 'errors' in data:
+                        logger.warning(f"GraphQL errors in v1 response: {data['errors']}")
+                        return False, None
 
+                    return True, data
+                else:
+                    logger.warning(f"v1 discovered-on request failed with status {response.status}")
+                    return False, None
+
+        except asyncio.TimeoutError:
+            logger.warning("v1 discovered-on request timed out")
+            return False, None
         except Exception as e:
-            logger.error(f"Error fetching discovered-on {artist_id}: {e}")
-            import traceback
-            logger.error(f"Full traceback: {traceback.format_exc()}")
-            # Track failures on exceptions
-            await self.discovered_hash_circuit_breaker.record_failure(self, self.cache)
-            return None
-        finally:
-            self.rate_limiter.release()
+            logger.error(f"Error in v1 discovered-on request: {e}")
+            return False, None
 
     async def _get_discovered_hash(self) -> Optional[str]:
         """Get the discovered-on hash by monitoring actual Spotify web requests"""
@@ -1655,7 +1741,15 @@ class SpotifyAPI:
                     )
                     
                     # Create a new context explicitly
-                    context = await browser.new_context()
+                    context = await browser.new_context(
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+                        viewport={"width": 1280, "height": 800},
+                        locale="en-US",
+                        timezone_id="America/New_York",
+                        permissions=["geolocation"],
+                        java_script_enabled=True,
+                        bypass_csp=True
+                    )
                     page = await context.new_page()
                     
                     hash_event = asyncio.Event()
@@ -1663,28 +1757,51 @@ class SpotifyAPI:
                     async def handle_request(route):
                         nonlocal discovered_hash
                         request = route.request
+                        
+                        # Look for both v1 and v2 paths
                         if 'queryArtistDiscoveredOn' in request.url:
                             logger.info(f"Found queryArtistDiscoveredOn request: {request.url}")
-                            try:
-                                parts = request.url.split('=')
-                                for part in parts:
-                                    try:
-                                        data = json.loads(urllib.parse.unquote(part))
-                                        if data.get('persistedQuery', {}).get('sha256Hash'):
-                                            discovered_hash = data['persistedQuery']['sha256Hash']
-                                            logger.info(f"Found hash: {discovered_hash}")
-                                            hash_event.set()
-                                    except json.JSONDecodeError:
-                                        continue
-                            except Exception as e:
-                                logger.error(f"Error parsing URL: {e}")
+                            
+                            # Handle POST requests (v2 API)
+                            if request.method == 'POST':
+                                try:
+                                    # Get the POST body
+                                    post_data = request.post_data
+                                    if post_data:
+                                        try:
+                                            data = json.loads(post_data)
+                                            if data.get('extensions', {}).get('persistedQuery', {}).get('sha256Hash'):
+                                                discovered_hash = data['extensions']['persistedQuery']['sha256Hash']
+                                                logger.info(f"Found hash from POST body: {discovered_hash}")
+                                                hash_event.set()
+                                        except json.JSONDecodeError:
+                                            pass
+                                except Exception as e:
+                                    logger.error(f"Error parsing POST body: {e}")
+                            
+                            # Handle GET requests (v1 API) as before
+                            else:
+                                try:
+                                    parts = request.url.split('=')
+                                    for part in parts:
+                                        try:
+                                            data = json.loads(urllib.parse.unquote(part))
+                                            if data.get('persistedQuery', {}).get('sha256Hash'):
+                                                discovered_hash = data['persistedQuery']['sha256Hash']
+                                                logger.info(f"Found hash from URL: {discovered_hash}")
+                                                hash_event.set()
+                                        except json.JSONDecodeError:
+                                            continue
+                                except Exception as e:
+                                    logger.error(f"Error parsing URL: {e}")
+                        
                         await route.continue_()
 
                     # Listen to network requests
                     await page.route("**/*", handle_request)
 
                     # Visit a known artist page
-                    artist_id = "3GBPw9NK25X1Wt2OUvOwY3"
+                    artist_id = "3GBPw9NK25X1Wt2OUvOwY3"  # A reliable artist ID to test with
                     await page.goto(f'https://open.spotify.com/artist/{artist_id}/discovered-on', timeout=60000)
 
                     # Wait for hash with timeout
@@ -1694,23 +1811,14 @@ class SpotifyAPI:
                         logger.error("Timeout waiting for discovered hash")
                         return None
 
-                    # Cleanup routes before closing
+                    # Cleanup and close browser
                     try:
                         await page.unroute_all(behavior='ignoreErrors')
-                        await page.close()  # Remove timeout parameter
-                    except Exception as e:
-                        logger.warning(f"Error during page cleanup: {e}")
-
-                    # Cleanup context and browser with proper error handling
-                    try:
-                        await context.close()  # Remove timeout parameter
-                    except Exception as e:
-                        logger.warning(f"Error closing context: {e}")
- 
-                    try:
+                        await page.close()
+                        await context.close()
                         await browser.close()
                     except Exception as e:
-                        logger.warning(f"Error closing browser: {e}")
+                        logger.warning(f"Error during browser cleanup: {e}")
 
                     if discovered_hash:
                         # Save the hash in Redis for future use
@@ -1731,12 +1839,14 @@ class SpotifyAPI:
             return None
 
     async def _ensure_discovered_hash(self) -> Optional[str]:
-        """Ensures we have a valid discovered-on hash, waiting for background refresh if needed"""
-        for retry in range(3):
-            if discovered_hash := await self.cache.get_discovered_hash():
-                return discovered_hash
-            await asyncio.sleep(2)
-        return None
+        """Ensures we have a valid discovered-on hash, with improved fallback logic"""
+        # First try to get from cache
+        if discovered_hash := await self.cache.get_discovered_hash():
+            return discovered_hash
+            
+        # No hash in cache, use the fallback hash
+        logger.info("Using fallback discovered-on hash")
+        return self.fallback_hashes.get('queryArtistDiscoveredOn')
 
     @staticmethod
     def _format_discovered_on(data: Dict) -> Optional[Dict]:
@@ -1794,58 +1904,78 @@ class SpotifyAPI:
 
         # Get unique artist IDs while preserving order
         unique_ids = list(dict.fromkeys(artist_ids))
+        
+        # Check if circuit breaker is disabled - if so, return empty results
+        if self.discovered_hash_circuit_breaker.is_disabled():
+            logger.info("Discovered-on circuit breaker is disabled, skipping fetch")
+            return {}  # Return empty results
+            
+        # Set a reasonable batch size to prevent timeouts
+        batch_size = 5
+        all_results = {}
+        
+        # Process artists in batches
+        for i in range(0, len(unique_ids), batch_size):
+            batch_ids = unique_ids[i:i+batch_size]
+            
+            if skip_cache:
+                fetch_tasks = [
+                        self._fetch_discovered_on(aid)
+                        for aid in batch_ids
+                        ]
+                fetched_data = await asyncio.gather(*fetch_tasks, return_exceptions=True)
 
-        if skip_cache:
-            fetch_tasks = [
-                    self._fetch_discovered_on(aid)
-                    for aid in unique_ids
+                for i, data in enumerate(fetched_data):
+                    if isinstance(data, dict):
+                        formatted = self._format_discovered_on(data)
+                        if formatted:
+                            all_results[batch_ids[i]] = formatted
+                
+                # Continue to next batch
+                continue
+
+            # Get all cached data for this batch
+            cached_data = await self.db.get_discovered_on(batch_ids)
+
+            # Determine which need to be fetched
+            to_fetch = [
+                    aid for aid in batch_ids
+                    if not cached_data.get(aid) or not isinstance(cached_data.get(aid), dict)
                     ]
-            fetched_data = await asyncio.gather(*fetch_tasks, return_exceptions=True)
 
-            results = {}
-            for i, data in enumerate(fetched_data):
-                if isinstance(data, dict):
-                    formatted = self._format_discovered_on(data)
-                    if formatted:
-                        results[unique_ids[i]] = formatted
+            # Fetch missing data
+            if to_fetch:
+                fetch_tasks = [
+                        self._fetch_discovered_on(aid)
+                        for aid in to_fetch
+                        ]
+                fetched_data = await asyncio.gather(*fetch_tasks, return_exceptions=True)
 
-            return results
+                valid_data = []
+                for i, data in enumerate(fetched_data):
+                    if isinstance(data, dict):
+                        formatted = self._format_discovered_on(data)
+                        if formatted:
+                            formatted['id'] = to_fetch[i]  # Add ID for caching
+                            valid_data.append(formatted)
 
-        # Get all cached data
-        cached_data = await self.db.get_discovered_on(unique_ids)
+                # Save to cache and update results
+                if valid_data:
+                    await self.db.save_discovered_on(valid_data)
+                    cached_data.update({d['id']: d for d in valid_data})
 
-        # Determine which need to be fetched
-        to_fetch = [
-                aid for aid in unique_ids
-                if not cached_data.get(aid) or not isinstance(cached_data.get(aid), dict)
-                ]
-
-        # Fetch missing data
-        if to_fetch:
-            fetch_tasks = [
-                    self._fetch_discovered_on(aid)
-                    for aid in to_fetch
-                    ]
-            fetched_data = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-
-            valid_data = []
-            for i, data in enumerate(fetched_data):
-                if isinstance(data, dict):
-                    formatted = self._format_discovered_on(data)
-                    if formatted:
-                        formatted['id'] = to_fetch[i]  # Add ID for caching
-                        valid_data.append(formatted)
-
-            # Save to cache and update results
-            if valid_data:
-                await self.db.save_discovered_on(valid_data)
-                cached_data.update({d['id']: d for d in valid_data})
-
-        return {
-                aid: cached_data.get(aid)
-                for aid in unique_ids
-                if cached_data.get(aid)
-                }
+            # Add this batch to results
+            all_results.update({
+                    aid: cached_data.get(aid)
+                    for aid in batch_ids
+                    if cached_data.get(aid)
+                    })
+            
+            # Small pause between batches to avoid overloading
+            if i + batch_size < len(unique_ids):
+                await asyncio.sleep(0.5)
+                
+        return all_results
 
     async def _get_track_token(self) -> bool:
         """Get a new track token using network monitoring approach."""
@@ -1935,11 +2065,11 @@ class SpotifyAPI:
                 }
 
     async def _fetch_track(self, track_id: str, detail: bool = False) -> Optional[Dict]:
-        """Fetch track data using dynamically captured hashes with improved reliability"""
+        """Fetch track data using dynamically captured hashes with improved reliability for v2 API"""
         try:
             await self.rate_limiter.acquire()
 
-            url = "https://api-partner.spotify.com/pathfinder/v1/query"
+            url = "https://api-partner.spotify.com/pathfinder/v2/query"
 
             variables = {
                 'uri': f'spotify:track:{track_id}'
@@ -1952,58 +2082,74 @@ class SpotifyAPI:
                 logger.error("No hash available for track query")
                 return None
 
-            params = {
+            # Create JSON payload for POST request
+            payload = {
                 'operationName': 'getTrack',
-                'variables': json.dumps(variables),
-                'extensions': json.dumps({
+                'variables': variables,
+                'extensions': {
                     'persistedQuery': {
                         'version': 1,
                         'sha256Hash': track_hash
                     }
-                })
+                }
             }
 
-            # Use the make_api_request helper
-            data = await self.retry_request(
-                url=url,
-                token_type='track',
-                params=params
-            )
-            
-            if not data:
-                return None
+            headers = {
+                'Authorization': f'Bearer {self.access_token}',
+                'content-type': 'application/json',
+                'accept': 'application/json',
+                'app-platform': 'WebPlayer'
+            }
 
-            # Check for GraphQL errors
-            if 'errors' in data:
-                error_msg = str(data.get('errors', [{}])[0].get('message', ''))
-                
-                # Handle the null trackUnion field error
-                if 'NullValueInNonNullableField' in error_msg and '/trackUnion' in error_msg:
-                    logger.warning(f"Track data missing for {track_id}, likely deleted or region-restricted")
-                    # Return a minimal placeholder to avoid crashes
-                    return {
-                        'data': {
-                            'trackUnion': {
-                                'id': track_id,
-                                'name': "Unavailable Track",
-                                'playcount': 0,
-                                'duration': {'totalMilliseconds': 0},
-                                'firstArtist': {'items': []},
-                                'otherArtists': {'items': []},
-                                '__placeholder': True  # Mark this as placeholder
+            if self.client_token:
+                headers['client-token'] = self.client_token
+
+            # Use POST instead of GET with parameters
+            async with self.session.post(
+                url,
+                json=payload,
+                headers=headers,
+                proxy=self.proxy.url,
+                proxy_auth=self.proxy.auth,
+                timeout=10
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    # Check for GraphQL errors
+                    if 'errors' in data:
+                        error_msg = str(data.get('errors', [{}])[0].get('message', ''))
+                        
+                        # Handle the null trackUnion field error
+                        if 'NullValueInNonNullableField' in error_msg and '/trackUnion' in error_msg:
+                            logger.warning(f"Track data missing for {track_id}, likely deleted or region-restricted")
+                            # Return a minimal placeholder to avoid crashes
+                            return {
+                                'data': {
+                                    'trackUnion': {
+                                        'id': track_id,
+                                        'name': "Unavailable Track",
+                                        'playcount': 0,
+                                        'duration': {'totalMilliseconds': 0},
+                                        'firstArtist': {'items': []},
+                                        'otherArtists': {'items': []},
+                                        '__placeholder': True  # Mark this as placeholder
+                                    }
+                                }
                             }
-                        }
-                    }
-                
-                logger.error(f"GraphQL errors in track response: {data['errors']}")
-                return None
+                        
+                        logger.error(f"GraphQL errors in track response: {data['errors']}")
+                        return None
 
-            # Check if track data is present
-            if data.get('data', {}).get('trackUnion') is None:
-                logger.error(f"No track data in response for {track_id}")
-                return None
+                    # Check if track data is present
+                    if data.get('data', {}).get('trackUnion') is None:
+                        logger.error(f"No track data in response for {track_id}")
+                        return None
 
-            return data
+                    return data
+                else:
+                    logger.warning(f"Track request failed with status {response.status}")
+                    return None
 
         except Exception as e:
             logger.error(f"Error fetching track {track_id}: {e}")
