@@ -442,13 +442,14 @@ class TokenWorker:
             logger.error(f"Error in browser cleanup: {e}")
 
     async def _get_proxy(self) -> Optional[ProxyConfig]:
-        """Get a new proxy from the proxy service"""
-        for attempt in range(3):
+        """Get a new proxy from the proxy service with WebShare fallback"""
+        # First try SubmitHub API
+        for attempt in range(2):  # Reduced attempts for SubmitHub
             try:
                 if not self.session:
                     self.session = aiohttp.ClientSession()
                     
-                async with self.session.get('https://api.submithub.com/api/proxy', timeout=15) as response:
+                async with self.session.get('https://api.submithub.com/api/proxy', timeout=10) as response:
                     if response.status == 200:
                         try:
                             proxy_data = await response.json()
@@ -461,11 +462,11 @@ class TokenWorker:
                             password = proxy_data.get('password')
                             
                             if not all([address, http_port, username, password]):
-                                logger.warning(f"Proxy data missing required fields (attempt {attempt+1})")
-                                await asyncio.sleep(2 * (attempt + 1))
+                                logger.warning(f"SubmitHub proxy data missing required fields (attempt {attempt+1})")
+                                await asyncio.sleep(1)
                                 continue
                             
-                            # Create proxy config manually
+                            # Create proxy config
                             proxy = ProxyConfig(
                                 address=address,
                                 port=http_port,
@@ -476,22 +477,89 @@ class TokenWorker:
                             
                             # Test the proxy before returning it
                             if await self._test_proxy(proxy):
-                                logger.info(f"Got working proxy: {proxy}")
+                                logger.info(f"Got working proxy from SubmitHub: {proxy}")
                                 return proxy
                             else:
-                                logger.warning(f"Proxy validation failed, retrying... (attempt {attempt+1})")
+                                logger.warning(f"SubmitHub proxy validation failed (attempt {attempt+1})")
                         except Exception as e:
-                            logger.error(f"Error processing proxy data (attempt {attempt+1}): {e}")
+                            logger.error(f"Error processing SubmitHub proxy data: {e}")
                     else:
-                        logger.warning(f"Failed to get proxy, status: {response.status} (attempt {attempt+1})")
+                        logger.warning(f"SubmitHub proxy request failed with status: {response.status}")
                 
+            except aiohttp.ClientConnectorError as e:
+                logger.warning(f"Connection error to SubmitHub (attempt {attempt+1}): {e}")
             except Exception as e:
-                logger.error(f"Error getting proxy (attempt {attempt+1}): {e}")
+                logger.error(f"Error getting proxy from SubmitHub (attempt {attempt+1}): {e}")
+            
+            # Short backoff before retry
+            if attempt < 1:
+                await asyncio.sleep(2)
+        
+        # If SubmitHub fails, fall back to WebShare API
+        logger.info("SubmitHub proxy acquisition failed, falling back to WebShare API")
+        
+        # WebShare API credentials
+        webshare_key = 'fd9e64adac30d6f46be5ad88b19fffbc42027418'  # 5TB jason@submithub.com
+        webshare_url = 'https://proxy.webshare.io/api/proxy/list/?page=1'
+        
+        for attempt in range(3):
+            try:
+                headers = {'Authorization': f'Token {webshare_key}'}
+                
+                async with self.session.get(webshare_url, headers=headers, timeout=15) as response:
+                    if response.status == 200:
+                        try:
+                            data = await response.json()
+                            
+                            # Check if we have results
+                            if not data.get('results') or len(data['results']) == 0:
+                                logger.warning(f"No proxies returned from WebShare (attempt {attempt+1})")
+                                await asyncio.sleep(2)
+                                continue
+                            
+                            # Pick a random proxy from the list
+                            proxies = data['results']
+                            proxy_data = random.choice(proxies)
+                            
+                            # Extract required fields from WebShare format
+                            address = proxy_data.get('proxy_address')
+                            ports = proxy_data.get('ports', {})
+                            http_port = ports.get('http') if isinstance(ports, dict) else None
+                            username = proxy_data.get('username')
+                            password = proxy_data.get('password')
+                            
+                            if not all([address, http_port, username, password]):
+                                logger.warning(f"WebShare proxy data missing required fields (attempt {attempt+1})")
+                                await asyncio.sleep(2)
+                                continue
+                            
+                            # Create proxy config
+                            proxy = ProxyConfig(
+                                address=address,
+                                port=http_port,
+                                username=username,
+                                password=password,
+                                created_at=int(time.time())
+                            )
+                            
+                            # Test the proxy before returning it
+                            if await self._test_proxy(proxy):
+                                logger.info(f"Got working proxy from WebShare: {proxy}")
+                                return proxy
+                            else:
+                                logger.warning(f"WebShare proxy validation failed (attempt {attempt+1})")
+                        except Exception as e:
+                            logger.error(f"Error processing WebShare proxy data: {e}")
+                    else:
+                        logger.warning(f"WebShare API request failed with status: {response.status}")
+                        
+            except Exception as e:
+                logger.error(f"Error getting proxy from WebShare (attempt {attempt+1}): {e}")
             
             # Backoff before retry
             await asyncio.sleep(2 * (attempt + 1))
         
-        logger.error("All proxy acquisition attempts failed")
+        logger.error("All proxy acquisition attempts failed (both SubmitHub and WebShare)")
         return None
 
     async def _test_proxy(self, proxy: ProxyConfig) -> bool:
