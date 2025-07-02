@@ -498,68 +498,81 @@ class TokenWorker:
         # If SubmitHub fails, fall back to WebShare API
         logger.info("SubmitHub proxy acquisition failed, falling back to WebShare API")
         
-        # WebShare API credentials
-        webshare_key = 'fd9e64adac30d6f46be5ad88b19fffbc42027418'  # 5TB jason@submithub.com
+        # WebShare API credentials - try primary key first, then fallback
+        webshare_keys = [
+            'fd9e64adac30d6f46be5ad88b19fffbc42027418',  # 5TB jason@submithub.com
+            'hq0724r10c3savv5yd5vlea81xnyq9tw7h26p0z5'   # 1TB analytics@submithub.com (fallback)
+        ]
         webshare_url = 'https://proxy.webshare.io/api/proxy/list/?page=1'
         
-        for attempt in range(3):
-            try:
-                headers = {'Authorization': f'Token {webshare_key}'}
-                
-                async with self.session.get(webshare_url, headers=headers, timeout=15) as response:
-                    if response.status == 200:
-                        try:
-                            data = await response.json()
-                            
-                            # Check if we have results
-                            if not data.get('results') or len(data['results']) == 0:
-                                logger.warning(f"No proxies returned from WebShare (attempt {attempt+1})")
-                                await asyncio.sleep(2)
-                                continue
-                            
-                            # Pick a random proxy from the list
-                            proxies = data['results']
-                            proxy_data = random.choice(proxies)
-                            
-                            # Extract required fields from WebShare format
-                            address = proxy_data.get('proxy_address')
-                            ports = proxy_data.get('ports', {})
-                            http_port = ports.get('http') if isinstance(ports, dict) else None
-                            username = proxy_data.get('username')
-                            password = proxy_data.get('password')
-                            
-                            if not all([address, http_port, username, password]):
-                                logger.warning(f"WebShare proxy data missing required fields (attempt {attempt+1})")
-                                await asyncio.sleep(2)
-                                continue
-                            
-                            # Create proxy config
-                            proxy = ProxyConfig(
-                                address=address,
-                                port=http_port,
-                                username=username,
-                                password=password,
-                                created_at=int(time.time())
-                            )
-                            
-                            # Test the proxy before returning it
-                            if await self._test_proxy(proxy):
-                                logger.info(f"Got working proxy from WebShare: {proxy}")
-                                return proxy
-                            else:
-                                logger.warning(f"WebShare proxy validation failed (attempt {attempt+1})")
-                        except Exception as e:
-                            logger.error(f"Error processing WebShare proxy data: {e}")
-                    else:
-                        logger.warning(f"WebShare API request failed with status: {response.status}")
-                        
-            except Exception as e:
-                logger.error(f"Error getting proxy from WebShare (attempt {attempt+1}): {e}")
+        # Try each API key
+        for key_index, webshare_key in enumerate(webshare_keys):
+            key_label = "primary" if key_index == 0 else "fallback"
+            logger.info(f"Trying WebShare with {key_label} API key")
             
-            # Backoff before retry
-            await asyncio.sleep(2 * (attempt + 1))
+            for attempt in range(2):  # 2 attempts per key
+                try:
+                    headers = {'Authorization': f'Token {webshare_key}'}
+                    
+                    async with self.session.get(webshare_url, headers=headers, timeout=15) as response:
+                        if response.status == 200:
+                            try:
+                                data = await response.json()
+                                
+                                # Check if we have results
+                                if not data.get('results') or len(data['results']) == 0:
+                                    logger.warning(f"No proxies returned from WebShare with {key_label} key (attempt {attempt+1})")
+                                    await asyncio.sleep(2)
+                                    continue
+                                
+                                # Pick a random proxy from the list
+                                proxies = data['results']
+                                proxy_data = random.choice(proxies)
+                                
+                                # Extract required fields from WebShare format
+                                address = proxy_data.get('proxy_address')
+                                ports = proxy_data.get('ports', {})
+                                http_port = ports.get('http') if isinstance(ports, dict) else None
+                                username = proxy_data.get('username')
+                                password = proxy_data.get('password')
+                                
+                                if not all([address, http_port, username, password]):
+                                    logger.warning(f"WebShare proxy data missing required fields with {key_label} key (attempt {attempt+1})")
+                                    await asyncio.sleep(2)
+                                    continue
+                                
+                                # Create proxy config
+                                proxy = ProxyConfig(
+                                    address=address,
+                                    port=http_port,
+                                    username=username,
+                                    password=password,
+                                    created_at=int(time.time())
+                                )
+                                
+                                # Test the proxy before returning it
+                                if await self._test_proxy(proxy):
+                                    logger.info(f"Got working proxy from WebShare using {key_label} key: {proxy}")
+                                    return proxy
+                                else:
+                                    logger.warning(f"WebShare proxy validation failed with {key_label} key (attempt {attempt+1})")
+                            except Exception as e:
+                                logger.error(f"Error processing WebShare proxy data with {key_label} key: {e}")
+                        else:
+                            logger.warning(f"WebShare API request failed with status {response.status} using {key_label} key")
+                            # If we get 401/403, likely the API key is invalid, try next key immediately
+                            if response.status in (401, 403):
+                                logger.warning(f"{key_label} API key appears to be invalid")
+                                break  # Skip to next API key
+                            
+                except Exception as e:
+                    logger.error(f"Error getting proxy from WebShare with {key_label} key (attempt {attempt+1}): {e}")
+                
+                # Backoff before retry (but not if switching to next key)
+                if attempt < 1:
+                    await asyncio.sleep(2)
         
-        logger.error("All proxy acquisition attempts failed (both SubmitHub and WebShare)")
+        logger.error("All proxy acquisition attempts failed (SubmitHub and both WebShare keys)")
         return None
 
     async def _test_proxy(self, proxy: ProxyConfig) -> bool:
